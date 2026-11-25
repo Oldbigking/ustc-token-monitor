@@ -45,6 +45,39 @@ add('NaN / Infinity / null', { kind: 'bar', color: '--blue', fmtV: tokY, data: b
 add('长标签', { kind: 'bar', color: '--blue', fmtV: tokY, data: [{ t: '2026-11-21T10:00', v: 5 }, { t: '2026-11-22T11:00', v: 9 }] }, [400, 190]);
 add('负数', { kind: 'bar', color: '--blue', fmtV: tokY, data: bars([-5, 10, 0, 20]) });
 
+/* 双轴：柱=token（左轴） + 线=tok/s（右轴） */
+add('dual 真实数据（含 null 折线）', {
+  kind: 'bar', color: '--green', fmtV: tokY, unit: '输出 token',
+  data: bars(TOK),
+  s2: { color: '--blue', fmtV: tpsY, unit: 'tok/s', data: bars(TPS) },
+}, [1106, 230]);
+add('dual 浅色主题', {
+  kind: 'bar', color: '--green', fmtV: tokY, unit: '输出 token',
+  data: bars(TOK),
+  s2: { color: '--blue', fmtV: tpsY, unit: 'tok/s', data: bars(TPS) },
+}, [1106, 230], 'light');
+add('dual 60 点（每分钟）', {
+  kind: 'bar', color: '--green', fmtV: tokY, unit: '输出 token',
+  data: Array.from({ length: 60 }, (_, i) => ({ t: '14:' + String(i).padStart(2, '0'), v: i % 7 === 0 ? 0 : 40000 + i * 1500 })),
+  s2: { color: '--blue', fmtV: tpsY, unit: 'tok/s', data: Array.from({ length: 60 }, (_, i) => ({ t: '14:' + String(i).padStart(2, '0'), v: i % 5 === 0 ? null : 20 + (i % 9) * 7 })) },
+}, [1106, 230]);
+add('dual 第二序列全 null', {
+  kind: 'bar', color: '--green', fmtV: tokY, data: bars(TOK),
+  s2: { color: '--blue', fmtV: tpsY, unit: 'tok/s', data: bars(TOK.map(() => null)) },
+});
+add('dual 第二序列为空', {
+  kind: 'bar', color: '--green', fmtV: tokY, data: bars(TOK),
+  s2: { color: '--blue', fmtV: tpsY, data: [] },
+});
+add('dual 窄容器 260px', {
+  kind: 'bar', color: '--green', fmtV: tokY, data: bars(TOK),
+  s2: { color: '--blue', fmtV: tpsY, unit: 'tok/s', data: bars(TPS) },
+}, [260, 190]);
+add('dual 右轴大数值', {
+  kind: 'bar', color: '--green', fmtV: tokY, data: bars([1, 2, 3]),
+  s2: { color: '--blue', fmtV: v => v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : String(Math.round(v)), unit: 'x', data: bars([1.2e6, 9e5, 8.4e5]) },
+});
+
 function measure(el) {
   const vb = el.getAttribute('viewBox').split(' ').map(Number);
   const W = vb[2], H = vb[3];
@@ -137,6 +170,32 @@ function run() {
     if (!inside) { fails.push('11-21 标签不在柱内'); }
     if (fill !== '#0b1220') { fails.push('11-21 标签对比色不对'); }
   }
+
+  /* 专项：双轴图的悬停提示要同时给出两个数值 */
+  const nx = 'ts' + (++seq);
+  const elx = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  elx.setAttribute('id', nx);
+  elx.setAttribute('class', 'chart');
+  elx.style.cssText = 'display:block;width:800px;height:190px';
+  doc.body.appendChild(elx);
+  w.applyTheme('dark', false);
+  w.chart(nx, {
+    kind: 'bar', color: '--green', fmtV: tokY, unit: '输出 token', data: bars(TOK),
+    s2: { color: '--blue', fmtV: tpsY, unit: 'tok/s', data: bars(TPS) },
+  });
+  const svgW = +elx.getAttribute('viewBox').split(' ')[2];
+  const bar0 = [...elx.querySelectorAll('rect')].filter(r => r.getAttribute('class') !== 'hvbar')[0];
+  const svgX = +bar0.getAttribute('x') + (+bar0.getAttribute('width')) / 2;
+  const rct = elx.getBoundingClientRect();
+  elx.dispatchEvent(new w.MouseEvent('mousemove', {
+    clientX: rct.left + svgX * rct.width / svgW, clientY: rct.top + 100, bubbles: true,
+  }));
+  const tip = doc.getElementById('tip');
+  const tipText = tip.textContent || '';
+  const want1 = tokY(TOK[0]), want2 = tpsY(TPS[0]);
+  const okTip = tip.style.display === 'block' && tipText.indexOf(want1) >= 0 && tipText.indexOf(want2) >= 0;
+  log.push('双轴悬停: ' + JSON.stringify(tipText) + ' → ' + (okTip ? 'ok（含 ' + want1 + ' 与 ' + want2 + '）' : 'FAIL'));
+  if (!okTip) fails.push('双轴悬停提示');
 
   document.getElementById('out').textContent =
     log.join('\n') + '\n\n共 ' + checked + ' 个用例，失败 ' + fails.length + ' 个' +

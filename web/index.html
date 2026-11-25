@@ -194,14 +194,10 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
     </div>
   </section>
 
-  <section class="two">
+  <section class="one">
     <div class="card">
-      <h2>每分钟输出 token<span class="hint">近 60 分钟</span></h2>
-      <svg class="chart" id="chartTokens"></svg>
-    </div>
-    <div class="card">
-      <h2>每分钟平均 tok/s<span class="hint">近 60 分钟</span></h2>
-      <svg class="chart" id="chartTps"></svg>
+      <h2>每分钟输出 token 与平均 tok/s<span class="hint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span></h2>
+      <svg class="chart" id="chartMinute"></svg>
     </div>
   </section>
 
@@ -300,30 +296,10 @@ function niceMax(v) {
   return step * e;
 }
 
-function chart(id, opts) {
-  let st = CHARTS[id];
-  if (!st) {
-    const el = $(id);
-    if (!el) return;
-    st = CHARTS[id] = { el, data: [], hov: -1, geom: null };
-    new ResizeObserver(() => draw(id)).observe(el);
-    el.addEventListener('mousemove', e => onHover(id, e));
-    el.addEventListener('mouseleave', () => { st.hov = -1; paint(id); tipEl.style.display = 'none'; });
-  }
-  st.kind = opts.kind;
-  st.colorVar = opts.color;
-  st.color = cssv(opts.color) || cssv('--green');
-  st.fmtV = opts.fmtV || (v => fmt(v));
-  st.unit = opts.unit || '';
-  st.ref = opts.ref || null;
-  st.data = opts.data || [];
-  draw(id);
-}
-
 /* 近似文字宽度：中文字符按满宽、其余按 0.58em，用于标签避让 */
 const textW = (txt, fs) => [...String(txt)].reduce((w, ch) => w + (ch.charCodeAt(0) > 255 ? fs : fs * 0.58), 0);
 
-/* 取颜色亮度，挑一个在柱子上看得清的文字颜色 */
+/* 取颜色亮度（0..1），null 表示解析不出来 */
 const lumOf = c => {
   let m = /^#([0-9a-f]{6})$/i.exec(c || ''), r, g, b;
   if (m) {
@@ -336,6 +312,7 @@ const lumOf = c => {
   const f = v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
   return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
 };
+
 /* 按对比度挑字色：亮底配深字、暗底配白字，取对比度更高的一边 */
 const onColor = c => {
   const L = lumOf(c);
@@ -345,10 +322,42 @@ const onColor = c => {
   return dark >= light ? '#0b1220' : '#ffffff';
 };
 
+
+function chart(id, opts) {
+  let st = CHARTS[id];
+  if (!st) {
+    const el = $(id);
+    if (!el) return;
+    st = CHARTS[id] = { el, data: [], hov: -1, geom: null };
+    new ResizeObserver(() => draw(id)).observe(el);
+    el.addEventListener('mousemove', e => onHover(id, e));
+    el.addEventListener('mouseleave', () => { st.hov = -1; paint(id); tipEl.style.display = 'none'; });
+  }
+  st.kind = opts.kind || 'bar';
+  st.colorVar = opts.color;
+  st.color = cssv(opts.color) || cssv('--green');
+  st.fmtV = opts.fmtV || (v => fmt(v));
+  st.unit = opts.unit || '';
+  st.ref = opts.ref || null;
+  st.data = opts.data || [];
+  /* 第二序列：共用横轴、独立右轴（例如柱=token，线=tok/s） */
+  st.s2 = opts.s2 ? {
+    data: opts.s2.data || [],
+    colorVar: opts.s2.color,
+    fmtV: opts.s2.fmtV || (v => fmt(v)),
+    unit: opts.s2.unit || '',
+  } : null;
+  draw(id);
+}
+
 function draw(id) {
   const st = CHARTS[id], el = st.el, data = st.data || [];
   const P = palette();
   st.color = cssv(st.colorVar) || P.axis;
+  const s2 = st.s2;
+  const dual = !!(s2 && s2.data && s2.data.length);
+  if (dual) s2.color = cssv(s2.colorVar) || P.axis;
+
   const W = Math.max(240, Math.round(el.clientWidth || 640));
   const H = Math.max(120, Math.round(el.clientHeight || 190));
   el.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
@@ -364,10 +373,17 @@ function draw(id) {
   for (let i = 0; i <= 4; i++) yText.push(String(st.fmtV(ymax * i / 4)));
   /* 左边距按最宽刻度动态计算，避免大数字被切掉 */
   const L = Math.max(PAD.l, Math.ceil(Math.max.apply(null, yText.map(t => textW(t, 10.5)))) + 14);
-  const R = W - PAD.r;
+
+  const nums2 = dual ? s2.data.map(d => Number(d.v)).filter(v => isFinite(v) && v > 0) : [];
+  const ymax2 = dual ? niceMax(Math.max(0, ...nums2)) : 1;
+  const y2Text = dual ? [0, 1, 2, 3, 4].map(i => String(s2.fmtV(ymax2 * i / 4))) : [];
+  const rpad = dual ? Math.ceil(Math.max.apply(null, y2Text.map(t => textW(t, 10.5)))) + 16 : PAD.r;
+
+  const R = W - rpad;
   const pw = Math.max(24, R - L);
-  const n = Math.max(1, data.length), bw = pw / n;
+  const n = Math.max(1, data.length, dual ? s2.data.length : 0), bw = pw / n;
   const yy = v => B - ph * (Math.min(Math.max(Number(v), 0), ymax) / ymax);
+  const y2 = v => B - ph * (Math.min(Math.max(Number(v), 0), ymax2) / ymax2);
 
   let s = '';
   const taken = [];                     /* 已占用的文字矩形，用于互相避让 */
@@ -377,6 +393,10 @@ function draw(id) {
          '" stroke="' + P.grid + '" stroke-width="1"' + (i ? ' stroke-dasharray="2 4"' : '') + '/>';
     s += '<text x="' + (L - 9) + '" y="' + (y0 + 3.5).toFixed(1) +
          '" fill="' + P.axis + '" font-size="10.5" text-anchor="end">' + esc(yText[i]) + '</text>';
+    if (dual) {
+      s += '<text x="' + (R + 7) + '" y="' + (y2(ymax2 * i / 4) + 3.5).toFixed(1) +
+           '" fill="' + s2.color + '" font-size="10.5" text-anchor="start" opacity="0.85">' + esc(y2Text[i]) + '</text>';
+    }
   }
 
   if (st.ref && refV > 0) {
@@ -392,10 +412,38 @@ function draw(id) {
     taken.push({ x: L + 3, y: rly - 9, w: rw, h: 12 });
   }
 
-  if (!data.length) {
+  if (!data.length && !dual) {
     s += '<text x="' + ((L + R) / 2).toFixed(1) + '" y="' + ((T + B) / 2).toFixed(1) +
          '" fill="' + P.dim + '" font-size="12" text-anchor="middle">暂无数据</text>';
   }
+
+  /* 折线（可分段，遇到 null 断开，不连成假趋势） */
+  const lineSvg = (arr, yFn, color) => {
+    let out = '', seg = [];
+    const flush = () => {
+      if (seg.length) {
+        if (seg.length > 1) {
+          out += '<path d="M' + seg[0][0].toFixed(1) + ',' + B + 'L' +
+                 seg.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join('L') + 'L' +
+                 seg[seg.length - 1][0].toFixed(1) + ',' + B + 'Z" fill="' + color + '" opacity="0.10"/>';
+          out += '<polyline points="' + seg.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ') +
+                 '" fill="none" stroke="' + color + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+        }
+        seg.forEach(p => {
+          out += '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="1.8" fill="' + color + '"/>';
+        });
+      }
+      seg = [];
+    };
+    arr.forEach((d, i) => {
+      if (d.v === null || d.v === undefined) { flush(); return; }
+      const v = Number(d.v);
+      if (!isFinite(v)) { flush(); return; }
+      seg.push([L + i * bw + bw / 2, yFn(v)]);
+    });
+    flush();
+    return out;
+  };
 
   if (st.kind === 'bar') {
     const showVal = bw >= 26;
@@ -424,30 +472,9 @@ function draw(id) {
       lastRight = cx + lw / 2;
     });
   } else {
-    let seg = [];
-    const flush = () => {
-      if (seg.length) {
-        if (seg.length > 1) {
-          s += '<path d="M' + seg[0][0].toFixed(1) + ',' + B + 'L' +
-               seg.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join('L') + 'L' +
-               seg[seg.length - 1][0].toFixed(1) + ',' + B + 'Z" fill="' + st.color + '" opacity="0.10"/>';
-          s += '<polyline points="' + seg.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ') +
-               '" fill="none" stroke="' + st.color + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
-        }
-        seg.forEach(p => {
-          s += '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="2" fill="' + st.color + '"/>';
-        });
-      }
-      seg = [];
-    };
-    data.forEach((d, i) => {
-      if (d.v === null || d.v === undefined) { flush(); return; }
-      const v = Number(d.v);
-      if (!isFinite(v)) { flush(); return; }
-      seg.push([L + i * bw + bw / 2, yy(v)]);
-    });
-    flush();
+    s += lineSvg(data, yy, st.color);
   }
+  if (dual) s += lineSvg(s2.data, y2, s2.color);
 
   /* x 轴：先按像素间距抽稀，再按实际字宽避让，首尾改对齐方式保证不被裁掉 */
   const lstep = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(pw / 64))));
@@ -470,11 +497,12 @@ function draw(id) {
   s += '<g class="hov" style="display:none">' +
        '<rect class="hvbar" x="0" y="' + T + '" width="0" height="' + ph + '" fill="' + P.txt + '" opacity="0.06"/>' +
        '<line x1="0" y1="' + T + '" x2="0" y2="' + B + '" stroke="' + P.hover + '" stroke-width="1" stroke-dasharray="3 3"/>' +
-       '<circle class="hvdot" cx="0" cy="' + T + '" r="3.5" fill="' + st.color + '" stroke="' + P.panel + '" stroke-width="1.5"/>' +
+       '<circle class="hvdot" cx="0" cy="' + T + '" r="3.5" fill="' + (dual ? s2.color : st.color) +
+       '" stroke="' + P.panel + '" stroke-width="1.5"/>' +
        '</g>';
 
   el.innerHTML = s;
-  st.geom = { W, H, L, R, T, B, bw, n, yy };
+  st.geom = { W, H, L, R, T, B, bw, n, yy, y2, dual };
   paint(id);
 }
 
@@ -483,7 +511,7 @@ function paint(id) {
   if (!g) return;
   const hov = st.el.querySelector('.hov');
   if (!hov) return;
-  const d = st.data[st.hov];
+  const d = st.data[st.hov] || (st.s2 && st.s2.data[st.hov]);
   if (!d) { hov.style.display = 'none'; return; }
   hov.style.display = '';
   const x = g.L + st.hov * g.bw + g.bw / 2;
@@ -491,7 +519,7 @@ function paint(id) {
   ln.setAttribute('x1', x.toFixed(1));
   ln.setAttribute('x2', x.toFixed(1));
   const rb = hov.querySelector('.hvbar');
-  if (st.kind === 'bar') {
+  if (st.kind === 'bar' || g.dual) {
     rb.style.display = '';
     rb.setAttribute('x', (g.L + st.hov * g.bw).toFixed(1));
     rb.setAttribute('width', g.bw.toFixed(1));
@@ -499,10 +527,14 @@ function paint(id) {
     rb.style.display = 'none';
   }
   const dot = hov.querySelector('.hvdot');
-  if (st.kind === 'line' && d.v !== null && d.v !== undefined) {
+  const d2 = g.dual && st.s2 ? st.s2.data[st.hov] : null;
+  const dotV = d2 && d2.v !== null && d2.v !== undefined && isFinite(Number(d2.v)) ? { v: d2.v, y: g.y2, c: st.s2.color }
+    : (g.dual ? null : (d.v !== null && d.v !== undefined && isFinite(Number(d.v)) ? { v: d.v, y: g.yy, c: st.color } : null));
+  if (dotV) {
     dot.style.display = '';
     dot.setAttribute('cx', x.toFixed(1));
-    dot.setAttribute('cy', g.yy(d.v).toFixed(1));
+    dot.setAttribute('cy', dotV.y(dotV.v).toFixed(1));
+    dot.setAttribute('fill', dotV.c);
   } else {
     dot.style.display = 'none';
   }
@@ -516,11 +548,15 @@ function onHover(id, e) {
   let i = Math.floor((x - g.L) / g.bw);
   i = Math.max(0, Math.min(g.n - 1, i));
   if (i !== st.hov) { st.hov = i; paint(id); }
-  const d = st.data[i];
-  if (!d || d.v === null || d.v === undefined) { tipEl.style.display = 'none'; return; }
-  tipEl.innerHTML = '<div class="k">' + d.t + '</div>' +
-    '<div><b>' + st.fmtV(d.v) + '</b> <span class="k">' + st.unit + '</span></div>' +
-    (d.extra ? '<div class="k">' + d.extra + '</div>' : '');
+  const d = st.data[i], d2 = st.s2 ? st.s2.data[i] : null;
+  const has1 = d && d.v !== null && d.v !== undefined && isFinite(Number(d.v));
+  const has2 = d2 && d2.v !== null && d2.v !== undefined && isFinite(Number(d2.v));
+  if (!has1 && !has2) { tipEl.style.display = 'none'; return; }
+  let html = '<div class="k">' + esc((d || d2).t) + '</div>';
+  if (has1) html += '<div><b>' + st.fmtV(d.v) + '</b> <span class="k">' + st.unit + '</span></div>';
+  if (has2) html += '<div><b>' + st.s2.fmtV(d2.v) + '</b> <span class="k">' + st.s2.unit + '</span></div>';
+  if (has1 && d.extra) html += '<div class="k">' + esc(d.extra) + '</div>';
+  tipEl.innerHTML = html;
   tipEl.style.display = 'block';
   const tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
   tipEl.style.left = Math.min(window.innerWidth - tw - 10, e.clientX + 16) + 'px';
@@ -617,15 +653,14 @@ async function tick() {
 
   /* 图表 */
   const minutes = d.minutes || [];
-  chart('chartTokens', {
+  chart('chartMinute', {
     kind: 'bar', color: '--green', fmtV: fx.tokY, unit: '输出 token',
     data: minutes.map(m => ({ t: m.t_local, v: m.completion,
       extra: m.req + ' 次 · 入 ' + fmt(m.prompt) + ' / 出 ' + fmt(m.completion) })),
-  });
-  chart('chartTps', {
-    kind: 'line', color: '--blue', fmtV: fx.tpsY, unit: 'tok/s',
-    data: minutes.map(m => ({ t: m.t_local, v: m.tps,
-      extra: m.req + ' 次 · ' + fmt(m.completion) + ' 输出 token' })),
+    s2: {
+      color: '--blue', fmtV: fx.tpsY, unit: 'tok/s',
+      data: minutes.map(m => ({ t: m.t_local, v: m.tps })),
+    },
   });
 
   const hist = d.history || [];
