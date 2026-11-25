@@ -487,25 +487,59 @@ def summarize(window_hours=1.0, recent=12, source=None):
     minute_anchor = (now // 60) * 60 - 59 * 60
     minutes = bucket([r for r in rows if r["t0"] >= minute_anchor], 60, minute_anchor, 60)
 
-    # 近 60 分钟一次调用都没有时，整张图只剩网格线。这里退回"以最后一次调用
-    # 结尾"的 60 分钟窗口，让闲置时也能看到最后一次活动长什么样。
-    minutes_alt = None
-    if not any(m["req"] for m in minutes):
-        last_any = max((r["t0"] for r in allrows), default=None)
-        if last_any is not None:
-            # 末次调用可能是个 0 输出的空转请求，那样整窗还是空的；优先锚在有输出的那次
-            pos = [r["t0"] for r in allrows if (r["completion"] or 0) > 0]
-            anchor_at = max(pos) if pos else last_any
-            alt_end = (int(anchor_at) // 60 + 1) * 60
-            alt_anchor = alt_end - 3600
-            minutes_alt = {
-                "minutes": bucket([r for r in allrows if r["t0"] >= alt_anchor],
-                                  60, alt_anchor, 60),
-                "start_local": local(alt_anchor).strftime("%m-%d %H:%M"),
-                "end_local": local(alt_end).strftime("%m-%d %H:%M"),
-                "last_call_local": local(last_any).strftime("%m-%d %H:%M"),
-                "idle_s": int(now - last_any),
-            }
+    # 折轴（时间轴压缩）：单段空档 >30 分钟就压成一个断点格子，其余照常；
+    # 这样闲置几小时后仍能看到"上次活动长什么样 —— 空了多久 —— 现在"。
+    minutes_cut = []
+    last_any = max((r["t0"] for r in allrows), default=None)
+    if last_any is not None:
+        lo = min(now - 48 * 3600, last_any - 1800)          # 至少覆盖上一次活动
+        a0 = (int(lo) // 60 + 1) * 60
+        cnt = max(1, int((now - a0) // 60) + 1)
+        raw = bucket([r for r in allrows if r["t0"] >= a0], 60, a0, cnt)
+
+        def _gap_label(sec):
+            m = max(1, int(round(sec / 60.0)))
+            if m < 60:
+                return f"{m}m"
+            if m < 1440:
+                return f"{m // 60}h{m % 60:02d}m"
+            d, rem = divmod(m, 1440)
+            return f"{d}d" + (f"{rem // 60}h" if rem >= 60 else "")
+
+        runs = {}                                           # 空档起点 -> 空档长度（仅 >30 分钟）
+        i = 0
+        while i < len(raw):
+            if raw[i]["req"]:
+                i += 1
+                continue
+            j = i
+            while j < len(raw) and not raw[j]["req"]:
+                j += 1
+            if j - i > 30:
+                runs[i] = j - i
+            i = j
+        i = 0
+        while i < len(raw):
+            ln = runs.get(i)
+            if ln:
+                to_ts = a0 + (i + ln) * 60 if i + ln < len(raw) else now
+                minutes_cut.append({
+                    "brk": True, "gap_s": ln * 60, "gap_label": _gap_label(ln * 60),
+                    "from_local": local(a0 + i * 60).strftime("%m-%d %H:%M"),
+                    "to_local": local(to_ts).strftime("%m-%d %H:%M"),
+                })
+                i += ln
+            else:
+                minutes_cut.append(raw[i])
+                i += 1
+        if len(minutes_cut) > 60:
+            minutes_cut = minutes_cut[-60:]
+        # 压缩模式下把开头的空白格子去掉（它们只是窗口起点带来的填充）
+        if any(x.get("brk") for x in minutes_cut):
+            while minutes_cut and not minutes_cut[0].get("brk") and not minutes_cut[0]["req"]:
+                minutes_cut.pop(0)
+        while minutes_cut and minutes_cut[0].get("brk"):
+            minutes_cut.pop(0)
 
     hour_anchor = day_start
     hours = bucket(rows, 3600, hour_anchor, 24)
@@ -596,7 +630,7 @@ def summarize(window_hours=1.0, recent=12, source=None):
         "ttft_ms": round(ttft_ms) if ttft_ms else None,
         "budgets": budgets,
         "minutes": minutes,
-        "minutes_alt": minutes_alt,
+        "minutes_cut": minutes_cut,
         "hours": hours,
         "history": history,
         "alltime": alltime,

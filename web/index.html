@@ -381,9 +381,20 @@ function draw(id) {
 
   const R = W - rpad;
   const pw = Math.max(24, R - L);
-  const n = Math.max(1, data.length, dual ? s2.data.length : 0), bw = pw / n;
+  const n = Math.max(1, data.length, dual ? s2.data.length : 0);
+  /* 折轴格子：断点占 2 个宽度单位，其余占 1，按比例换算像素位置 */
+  const units = [];
+  for (let i = 0; i < n; i++) units.push(data[i] && data[i].brk ? 2 : 1);
+  const unitW = pw / Math.max(1, units.reduce((a, b) => a + b, 0));
+  const xs = [], ws = [];
+  for (let i = 0, acc = L; i < n; i++) {
+    const w = unitW * units[i];
+    xs.push(acc); ws.push(w); acc += w;
+  }
+  const bw = unitW;
   const yy = v => B - ph * (Math.min(Math.max(Number(v), 0), ymax) / ymax);
   const y2 = v => B - ph * (Math.min(Math.max(Number(v), 0), ymax2) / ymax2);
+  const cxOf = i => xs[Math.min(i, n - 1)] + ws[Math.min(i, n - 1)] / 2;
 
   let s = '';
   const taken = [];                     /* 已占用的文字矩形，用于互相避让 */
@@ -436,10 +447,10 @@ function draw(id) {
       seg = [];
     };
     arr.forEach((d, i) => {
-      if (d.v === null || d.v === undefined) { flush(); return; }
+      if (d.brk || d.v === null || d.v === undefined) { flush(); return; }
       const v = Number(d.v);
       if (!isFinite(v)) { flush(); return; }
-      seg.push([L + i * bw + bw / 2, yFn(v)]);
+      seg.push([cxOf(i), yFn(v)]);
     });
     flush();
     return out;
@@ -449,10 +460,11 @@ function draw(id) {
     const showVal = bw >= 26;
     let lastRight = -1e9;
     data.forEach((d, i) => {
+      if (d.brk) return;
       const v = Number(d.v);
       if (!isFinite(v) || v <= 0) return;
-      const w = Math.max(2, bw * 0.64);
-      const x = L + i * bw + (bw - w) / 2;
+      const w = Math.max(2, ws[i] * 0.64);
+      const x = xs[i] + (ws[i] - w) / 2;
       const top = yy(v);
       s += '<rect x="' + x.toFixed(1) + '" y="' + top.toFixed(1) + '" width="' + w.toFixed(1) +
            '" height="' + Math.max(1, B - top).toFixed(1) + '" rx="1.5" fill="' + st.color + '"/>';
@@ -476,22 +488,49 @@ function draw(id) {
   }
   if (dual) s += lineSvg(s2.data, y2, s2.color);
 
-  /* x 轴：先按像素间距抽稀，再按实际字宽避让，首尾改对齐方式保证不被裁掉 */
-  const lstep = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(pw / 64))));
-  let lastRightX = -1e9;
+  /* 折轴标记：空档处一根竖虚线 + 斜杠符号，表示这里跳过了多久 */
   data.forEach((d, i) => {
-    if (i % lstep) return;
-    const label = String(d.t);
-    const lw = textW(label, 10.5);
-    const cx = L + i * bw + bw / 2;
+    if (!d.brk) return;
+    const cx = cxOf(i), mid = (T + B) / 2;
+    s += '<line x1="' + cx.toFixed(1) + '" y1="' + T + '" x2="' + cx.toFixed(1) + '" y2="' + B +
+         '" stroke="' + P.axis + '" stroke-width="1" stroke-dasharray="2 4" opacity="0.45"/>';
+    const slash = 'M' + (cx - 5).toFixed(1) + ',' + (mid + 5).toFixed(1) +
+                  'L' + (cx - 2).toFixed(1) + ',' + (mid - 5).toFixed(1) +
+                  'M' + (cx + 1).toFixed(1) + ',' + (mid + 5).toFixed(1) +
+                  'L' + (cx + 4).toFixed(1) + ',' + (mid - 5).toFixed(1);
+    s += '<path d="' + slash + '" stroke="' + P.panel + '" stroke-width="4" stroke-linecap="round"/>';
+    s += '<path d="' + slash + '" stroke="' + P.axis + '" stroke-width="1.5" stroke-linecap="round" opacity="0.9"/>';
+  });
+
+  /* x 轴：断点标签优先占位，时间标签按像素间距抽稀并避开它们 */
+  const labelAt = (label, fs, cx) => {
+    const lw = textW(label, fs);
     let x = cx, anchor = 'middle';
     if (cx - lw / 2 < 2) { x = Math.max(2, cx); anchor = 'start'; }
     else if (cx + lw / 2 > W - 2) { x = Math.min(W - 2, cx); anchor = 'end'; }
     const x0 = anchor === 'middle' ? x - lw / 2 : anchor === 'start' ? x : x - lw;
-    if (x0 < lastRightX + 6) return;
-    s += '<text x="' + x.toFixed(1) + '" y="' + (B + 16) + '" fill="' + P.axis +
-         '" font-size="10.5" text-anchor="' + anchor + '">' + esc(label) + '</text>';
-    lastRightX = x0 + lw;
+    return { label, fs, x, anchor, x0, lw };
+  };
+  const putLabel = (L2, isBrk) => {
+    s += '<text x="' + L2.x.toFixed(1) + '" y="' + (B + 16) + '" fill="' + P.axis +
+         '" font-size="' + L2.fs + '" text-anchor="' + L2.anchor + '"' +
+         (isBrk ? ' opacity="0.75"' : '') + '>' + esc(L2.label) + '</text>';
+  };
+  data.forEach((d, i) => {
+    if (!d.brk) return;
+    const L2 = labelAt(String(d.gap_label || '…'), 9.5, cxOf(i));
+    putLabel(L2, true);
+    taken.push({ x: L2.x0, y: B + 4, w: L2.lw, h: 14 });
+  });
+  const lstep = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(pw / 64))));
+  let lastRightX = -1e9;
+  data.forEach((d, i) => {
+    if (d.brk || i % lstep) return;
+    const L2 = labelAt(String(d.t), 10.5, cxOf(i));
+    if (L2.x0 < lastRightX + 6) return;
+    if (taken.some(b => L2.x0 < b.x + b.w && b.x < L2.x0 + L2.lw && B + 4 < b.y + b.h && b.y < B + 18)) return;
+    putLabel(L2, false);
+    lastRightX = L2.x0 + L2.lw;
   });
 
   s += '<g class="hov" style="display:none">' +
@@ -502,7 +541,7 @@ function draw(id) {
        '</g>';
 
   el.innerHTML = s;
-  st.geom = { W, H, L, R, T, B, bw, n, yy, y2, dual };
+  st.geom = { W, H, L, R, T, B, bw, n, yy, y2, dual, xs, ws };
   paint(id);
 }
 
@@ -514,19 +553,20 @@ function paint(id) {
   const d = st.data[st.hov] || (st.s2 && st.s2.data[st.hov]);
   if (!d) { hov.style.display = 'none'; return; }
   hov.style.display = '';
-  const x = g.L + st.hov * g.bw + g.bw / 2;
+  const x = g.xs[st.hov] + g.ws[st.hov] / 2;
   const ln = hov.querySelector('line');
   ln.setAttribute('x1', x.toFixed(1));
   ln.setAttribute('x2', x.toFixed(1));
   const rb = hov.querySelector('.hvbar');
-  if (st.kind === 'bar' || g.dual) {
+  if ((st.kind === 'bar' || g.dual) && !d.brk) {
     rb.style.display = '';
-    rb.setAttribute('x', (g.L + st.hov * g.bw).toFixed(1));
-    rb.setAttribute('width', g.bw.toFixed(1));
+    rb.setAttribute('x', g.xs[st.hov].toFixed(1));
+    rb.setAttribute('width', g.ws[st.hov].toFixed(1));
   } else {
     rb.style.display = 'none';
   }
   const dot = hov.querySelector('.hvdot');
+  if (d.brk) { dot.style.display = 'none'; return; }
   const d2 = g.dual && st.s2 ? st.s2.data[st.hov] : null;
   const dotV = d2 && d2.v !== null && d2.v !== undefined && isFinite(Number(d2.v)) ? { v: d2.v, y: g.y2, c: st.s2.color }
     : (g.dual ? null : (d.v !== null && d.v !== undefined && isFinite(Number(d.v)) ? { v: d.v, y: g.yy, c: st.color } : null));
@@ -545,10 +585,22 @@ function onHover(id, e) {
   if (!g) return;
   const r = st.el.getBoundingClientRect();
   const x = (e.clientX - r.left) * (g.W / Math.max(1, r.width));
-  let i = Math.floor((x - g.L) / g.bw);
-  i = Math.max(0, Math.min(g.n - 1, i));
+  let i = g.n - 1;
+  for (let k = 0; k < g.n; k++) {
+    if (x >= g.xs[k] && x < g.xs[k] + g.ws[k]) { i = k; break; }
+    if (x < g.xs[k]) { i = Math.max(0, k - 1); break; }
+  }
   if (i !== st.hov) { st.hov = i; paint(id); }
   const d = st.data[i], d2 = st.s2 ? st.s2.data[i] : null;
+  if (d && d.brk) {
+    tipEl.innerHTML = '<div class="k">空档 · 无调用</div>' +
+      '<div><b>' + esc(d.gap_label || '') + '</b> <span class="k">' + esc((d.from_local || '') + ' → ' + (d.to_local || '')) + '</span></div>';
+    tipEl.style.display = 'block';
+    const tw0 = tipEl.offsetWidth, th0 = tipEl.offsetHeight;
+    tipEl.style.left = Math.min(window.innerWidth - tw0 - 10, e.clientX + 16) + 'px';
+    tipEl.style.top = Math.max(10, e.clientY - th0 - 14) + 'px';
+    return;
+  }
   const has1 = d && d.v !== null && d.v !== undefined && isFinite(Number(d.v));
   const has2 = d2 && d2.v !== null && d2.v !== undefined && isFinite(Number(d2.v));
   if (!has1 && !has2) { tipEl.style.display = 'none'; return; }
@@ -652,23 +704,24 @@ async function tick() {
   $('bmeta').textContent = resetIn || '限额按 API Key 计，不随来源筛选变化';
 
   /* 图表 */
-  const minutes = d.minutes || [];
-  /* 近 60 分钟没有任何调用时，退回后端给的"末次调用结尾"窗口，别留一张空图 */
-  const hasRecent = minutes.some(m => m.req > 0);
-  const alt = d.minutes_alt;
-  const win = hasRecent ? minutes : (alt ? alt.minutes : []);
-  $('minuteHint').textContent = hasRecent
-    ? '近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）'
-    : alt
-      ? `近 1h 无调用 · 回退到 ${alt.start_local}–${alt.end_local}（末次 ${alt.last_call_local}）`
-      : '还没有调用记录';
+  /* 折轴时间线：>30 分钟的空档被压成一个断点格子 */
+  const win = d.minutes_cut || [];
+  const hasBrk = win.some(m => m.brk);
+  $('minuteHint').textContent = !win.length
+    ? '还没有调用记录'
+    : hasBrk
+      ? '空档已压缩（>30 分钟折轴）· 柱：输出 token（左轴）· 折线：tok/s（右轴）'
+      : '近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）';
   chart('chartMinute', {
     kind: 'bar', color: '--green', fmtV: fx.tokY, unit: '输出 token',
-    data: win.map(m => ({ t: m.t_local, v: m.completion,
-      extra: m.req + ' 次 · 入 ' + fmt(m.prompt) + ' / 出 ' + fmt(m.completion) })),
+    data: win.map(m => m.brk
+      ? { t: m.gap_label, brk: true, gap_label: m.gap_label,
+          from_local: m.from_local, to_local: m.to_local }
+      : { t: m.t_local, v: m.completion,
+          extra: m.req + ' 次 · 入 ' + fmt(m.prompt) + ' / 出 ' + fmt(m.completion) }),
     s2: {
       color: '--blue', fmtV: fx.tpsY, unit: 'tok/s',
-      data: win.map(m => ({ t: m.t_local, v: m.tps })),
+      data: win.map(m => ({ t: m.t_local, v: m.brk ? null : m.tps })),
     },
   });
 

@@ -78,6 +78,27 @@ add('dual 右轴大数值', {
   s2: { color: '--blue', fmtV: v => v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : String(Math.round(v)), unit: 'x', data: bars([1.2e6, 9e5, 8.4e5]) },
 });
 
+/* 折轴：空档压缩成断点格子 */
+const brk = (min) => ({ t: '…', brk: true, gap_label: min >= 1440 ? Math.round(min / 1440) + 'd' : min >= 60 ? Math.floor(min / 60) + 'h' + String(min % 60).padStart(2, '0') + 'm' : min + 'm', from_local: '11-22 23:00', to_local: '11-23 02:12' });
+const seg = (n, base) => Array.from({ length: n }, (_, i) => ({ t: '10:' + String((base + i) % 60).padStart(2, '0'), v: 20000 + (i % 5) * 9000 }));
+add('折轴 一段空档', {
+  kind: 'bar', color: '--green', fmtV: tokY, unit: '输出 token',
+  data: [...seg(12, 0), brk(192), ...seg(12, 40)],
+  s2: { color: '--blue', fmtV: tpsY, unit: 'tok/s', data: [...seg(12, 0), brk(192), ...seg(12, 40)].map((d, i) => ({ t: d.t, v: d.brk ? null : 30 + i })) },
+}, [1106, 230]);
+add('折轴 两个空档', {
+  kind: 'bar', color: '--green', fmtV: tokY, data: [...seg(8, 0), brk(45), ...seg(8, 20), brk(2880), ...seg(8, 50)],
+}, [1106, 230]);
+add('折轴 浅色', {
+  kind: 'bar', color: '--green', fmtV: tokY, data: [...seg(20, 0), brk(600)],
+}, [900, 200], 'light');
+add('折轴 断点在首', {
+  kind: 'bar', color: '--green', fmtV: tokY, data: [brk(90), ...seg(18, 10)],
+});
+add('折轴 全是断点', {
+  kind: 'bar', color: '--green', fmtV: tokY, data: [brk(90), brk(60), brk(30)],
+});
+
 function measure(el) {
   const vb = el.getAttribute('viewBox').split(' ').map(Number);
   const W = vb[2], H = vb[3];
