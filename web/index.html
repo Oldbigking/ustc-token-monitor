@@ -209,14 +209,10 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
     </div>
   </section>
 
-  <section class="two">
+  <section class="one">
     <div class="card">
-      <h2>每日平均 tok/s<span class="hint">虚线为历史均值</span></h2>
-      <svg class="chart" id="chartDayTps"></svg>
-    </div>
-    <div class="card">
-      <h2>每日平均首 token 延迟<span class="hint">虚线为历史均值</span></h2>
-      <svg class="chart" id="chartDayTtft"></svg>
+      <h2>每日平均 tok/s 与首 token 延迟<span class="hint">线：tok/s（左轴）· 线：首 token 秒（右轴）· 虚线为 tok/s 历史均值</span></h2>
+      <svg class="chart" id="chartDayPerf"></svg>
     </div>
   </section>
 
@@ -537,8 +533,12 @@ function draw(id) {
   s += '<g class="hov" style="display:none">' +
        '<rect class="hvbar" x="0" y="' + T + '" width="0" height="' + ph + '" fill="' + P.txt + '" opacity="0.06"/>' +
        '<line x1="0" y1="' + T + '" x2="0" y2="' + B + '" stroke="' + P.hover + '" stroke-width="1" stroke-dasharray="3 3"/>' +
-       '<circle class="hvdot" cx="0" cy="' + T + '" r="3.5" fill="' + (dual ? s2.color : st.color) +
-       '" stroke="' + P.panel + '" stroke-width="1.5"/>' +
+       (st.kind === 'bar' || dual
+         ? '<circle class="hvdot" data-s="0" cx="0" cy="' + T + '" r="3.5" fill="' + st.color +
+           '" stroke="' + P.panel + '" stroke-width="1.5"/>'
+         : '') +
+       (dual ? '<circle class="hvdot" data-s="1" cx="0" cy="' + T + '" r="3.5" fill="' + s2.color +
+           '" stroke="' + P.panel + '" stroke-width="1.5"/>' : '') +
        '</g>';
 
   el.innerHTML = s;
@@ -566,19 +566,22 @@ function paint(id) {
   } else {
     rb.style.display = 'none';
   }
-  const dot = hov.querySelector('.hvdot');
-  if (d.brk) { dot.style.display = 'none'; return; }
-  const d2 = g.dual && st.s2 ? st.s2.data[st.hov] : null;
-  const dotV = d2 && d2.v !== null && d2.v !== undefined && isFinite(Number(d2.v)) ? { v: d2.v, y: g.y2, c: st.s2.color }
-    : (g.dual ? null : (d.v !== null && d.v !== undefined && isFinite(Number(d.v)) ? { v: d.v, y: g.yy, c: st.color } : null));
-  if (dotV) {
-    dot.style.display = '';
-    dot.setAttribute('cx', x.toFixed(1));
-    dot.setAttribute('cy', dotV.y(dotV.v).toFixed(1));
-    dot.setAttribute('fill', dotV.c);
-  } else {
-    dot.style.display = 'none';
-  }
+  if (d.brk) { hov.querySelectorAll('.hvdot').forEach(c => { c.style.display = 'none'; }); return; }
+  const series = [
+    { s: '0', y: g.yy, d },
+    g.dual && st.s2 ? { s: '1', y: g.y2, d: st.s2.data[st.hov] } : null,
+  ].filter(Boolean);
+  hov.querySelectorAll('.hvdot').forEach(c => {
+    const it = series.find(v => v.s === c.getAttribute('data-s'));
+    const dv = it && it.d ? it.d.v : null;
+    if (dv === null || dv === undefined || !isFinite(Number(dv))) {
+      c.style.display = 'none';
+    } else {
+      c.style.display = '';
+      c.setAttribute('cx', x.toFixed(1));
+      c.setAttribute('cy', it.y(dv).toFixed(1));
+    }
+  });
 }
 
 function onHover(id, e) {
@@ -602,8 +605,8 @@ function onHover(id, e) {
     tipEl.style.top = Math.max(10, e.clientY - th0 - 14) + 'px';
     return;
   }
-  const has1 = d && d.v !== null && d.v !== undefined && isFinite(Number(d.v));
-  const has2 = d2 && d2.v !== null && d2.v !== undefined && isFinite(Number(d2.v));
+  const num = x => x && x.v !== null && x.v !== undefined && isFinite(Number(x.v));
+  const has1 = num(d), has2 = num(d2);
   if (!has1 && !has2) { tipEl.style.display = 'none'; return; }
   let html = '<div class="k">' + esc((d || d2).t) + '</div>';
   if (has1) html += '<div><b>' + st.fmtV(d.v) + '</b> <span class="k">' + st.unit + '</span></div>';
@@ -759,17 +762,15 @@ async function tick() {
     data: hist.map(h => ({ t: h.date.slice(5), v: h.tokens,
       extra: h.req + ' 次 · 费用 ' + Number(h.spend || 0).toFixed(2) })),
   });
-  chart('chartDayTps', {
-    kind: 'bar', color: '--green', fmtV: fx.tpsY, unit: 'tok/s',
+  chart('chartDayPerf', {
+    kind: 'line', color: '--green', fmtV: fx.tpsY, unit: 'tok/s',
     ref: at.tps ? { value: at.tps, label: '均值' } : null,
     data: hist.map(h => ({ t: h.date.slice(5), v: h.tps,
       extra: h.req + ' 次 · ' + fmt(h.tokens) + ' token' })),
-  });
-  chart('chartDayTtft', {
-    kind: 'bar', color: '--amber', fmtV: fx.msY, unit: '首 token',
-    ref: at.ttft_ms ? { value: at.ttft_ms, label: '均值' } : null,
-    data: hist.map(h => ({ t: h.date.slice(5), v: h.ttft_ms,
-      extra: h.req + ' 次请求' })),
+    s2: {
+      color: '--amber', fmtV: fx.msY, unit: '首 token',
+      data: hist.map(h => ({ t: h.date.slice(5), v: h.ttft_ms })),
+    },
   });
 
   /* 最近请求 */
