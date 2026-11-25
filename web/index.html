@@ -86,6 +86,7 @@ select:focus-visible,button:focus-visible{outline:2px solid color-mix(in srgb,va
 h2{font-size:12.5px;color:var(--dim);font-weight:550;margin:0 0 10px;letter-spacing:.5px;
   display:flex;align-items:center;gap:8px}
 h2 .hint{margin-left:auto;font-weight:400;letter-spacing:0}
+h2 .gapsel{font-size:11px;padding:2px 4px;border-radius:6px;letter-spacing:0;flex:none}
 section{margin-top:18px}
 
 /* ---------- 图表 ---------- */
@@ -196,7 +197,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
 
   <section class="one">
     <div class="card">
-      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span></h2>
+      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span><select id="gapSel" class="gapsel" title="空档折叠阈值：超过这个时长的空档会压成一个断点"><option value="5">空档 5m</option><option value="15">空档 15m</option><option value="30">空档 30m</option><option value="60">空档 1h</option><option value="180">空档 3h</option></select></h2>
       <svg class="chart" id="chartMinute"></svg>
     </div>
   </section>
@@ -616,7 +617,29 @@ function onHover(id, e) {
 }
 
 /* ================= 渲染 ================= */
-let CURRENT_SOURCE = new URLSearchParams(location.search).get('source') || '';
+const QS = new URLSearchParams(location.search);
+let CURRENT_SOURCE = QS.get('source') || '';
+const GAP_CHOICES = [5, 15, 30, 60, 180];
+function initGap() {
+  const fromUrl = parseInt(QS.get('gap'), 10);
+  const fromLs = parseInt(localStorage.getItem('gapMin'), 10);
+  const v = GAP_CHOICES.includes(fromUrl) ? fromUrl
+    : GAP_CHOICES.includes(fromLs) ? fromLs : 30;
+  const sel = $('gapSel');
+  sel.innerHTML = GAP_CHOICES.map(m =>
+    '<option value="' + m + '">空档 ' + (m >= 60 ? (m / 60) + 'h' : m + 'm') + '</option>').join('');
+  sel.value = String(v);
+  sel.addEventListener('change', () => {
+    const next = parseInt(sel.value, 10) || 30;
+    localStorage.setItem('gapMin', String(next));
+    const q = new URLSearchParams(location.search);
+    q.set('gap', String(next));
+    history.replaceState(null, '', '?' + q.toString());
+    tick();
+  });
+  return v;
+}
+let GAP_MIN = 30;
 let LAST = null;
 
 function syncSources(d) {
@@ -649,7 +672,10 @@ function renderBudget(b, ids) {
 async function tick() {
   let d;
   try {
-    const q = CURRENT_SOURCE ? '?source=' + encodeURIComponent(CURRENT_SOURCE) : '';
+    const qp = new URLSearchParams();
+    if (CURRENT_SOURCE) qp.set('source', CURRENT_SOURCE);
+    qp.set('gap', String(GAP_MIN));
+    const q = '?' + qp.toString();
     d = await (await fetch('/api/summary' + q, { cache: 'no-store' })).json();
   } catch (err) {
     $('dot').className = 'dot err';
@@ -704,13 +730,15 @@ async function tick() {
   $('bmeta').textContent = resetIn || '限额按 API Key 计，不随来源筛选变化';
 
   /* 图表 */
-  /* 折轴时间线：>30 分钟的空档被压成一个断点格子 */
+  /* 折轴时间线：超过阈值的空档被压成一个断点格子 */
   const win = d.minutes_cut || [];
   const hasBrk = win.some(m => m.brk);
+  const gsel = $('gapSel');
+  if (gsel.value !== String(GAP_MIN)) gsel.value = String(GAP_MIN);
   $('minuteHint').textContent = !win.length
     ? '还没有调用记录'
     : hasBrk
-      ? '空档已压缩（>30 分钟折轴）· 柱：输出 token（左轴）· 折线：tok/s（右轴）'
+      ? `空档已压缩（>${GAP_MIN >= 60 ? GAP_MIN / 60 + 'h' : GAP_MIN + 'm'} 折轴）· 柱：输出 token（左轴）· 折线：tok/s（右轴）`
       : '近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）';
   chart('chartMinute', {
     kind: 'bar', color: '--green', fmtV: fx.tokY, unit: '输出 token',
@@ -771,6 +799,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 });
 
 applyTheme(mode, false);
+GAP_MIN = initGap();
 tick();
 setInterval(tick, 10000);
 </script>

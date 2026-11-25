@@ -404,7 +404,7 @@ def build_sources(allrows):
     return sorted(out, key=lambda x: -x["tokens"])
 
 
-def summarize(window_hours=1.0, recent=12, source=None):
+def summarize(window_hours=1.0, recent=12, source=None, gap_min=30):
     now = time.time()
     day_start = local(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     w_start = now - window_hours * 3600
@@ -487,7 +487,7 @@ def summarize(window_hours=1.0, recent=12, source=None):
     minute_anchor = (now // 60) * 60 - 59 * 60
     minutes = bucket([r for r in rows if r["t0"] >= minute_anchor], 60, minute_anchor, 60)
 
-    # 折轴（时间轴压缩）：单段空档 >30 分钟就压成一个断点格子，其余照常；
+    # 折轴（时间轴压缩）：单段空档超过阈值（默认 30 分钟）就压成一个断点格子，其余照常；
     # 这样闲置几小时后仍能看到"上次活动长什么样 —— 空了多久 —— 现在"。
     minutes_cut = []
     last_any = max((r["t0"] for r in allrows), default=None)
@@ -515,7 +515,7 @@ def summarize(window_hours=1.0, recent=12, source=None):
             j = i
             while j < len(raw) and not raw[j]["req"]:
                 j += 1
-            if j - i > 30:
+            if j - i > gap_min:
                 runs[i] = j - i
             i = j
         i = 0
@@ -631,6 +631,7 @@ def summarize(window_hours=1.0, recent=12, source=None):
         "budgets": budgets,
         "minutes": minutes,
         "minutes_cut": minutes_cut,
+        "gap_min": gap_min,
         "hours": hours,
         "history": history,
         "alltime": alltime,
@@ -699,7 +700,12 @@ class Handler(BaseHTTPRequestHandler):
                 (time.time(), self.headers.get("User-Agent", "")[:60]))
             source = (query.get("source") or [None])[0] or None
             try:
-                body = json.dumps(summarize(source=source), ensure_ascii=False)
+                gap_min = int((query.get("gap") or ["30"])[0])
+            except (TypeError, ValueError):
+                gap_min = 30
+            gap_min = max(1, min(1440, gap_min))
+            try:
+                body = json.dumps(summarize(source=source, gap_min=gap_min), ensure_ascii=False)
                 self._send(200, body, "application/json; charset=utf-8")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}), "application/json")
