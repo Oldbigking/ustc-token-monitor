@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>chart selftest</title>
+<body style="margin:0;background:#0b0e13;color:#cfe">
+<iframe id="f" src="./index.html" style="width:1260px;height:2400px;border:0;position:absolute;left:-20000px"></iframe>
+<pre id="out" style="font:12px/1.5 monospace;white-space:pre-wrap;padding:12px">running…</pre>
+<script>
+'use strict';
+const log = [];
+const cases = [];
+let seq = 0;
+
+const tokY = v => v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? Math.round(v / 1e3) + 'k' : String(Math.round(v));
+const tpsY = v => v >= 100 ? v.toFixed(0) : v.toFixed(1);
+const msY = v => v >= 1000 ? (v / 1000).toFixed(1) + 's' : Math.round(v) + 'ms';
+
+const D15 = ['10-29','10-30','11-03','11-04','11-05','11-06','11-09','11-16','11-19','11-20','11-21','11-22','11-23','11-24','11-25'];
+const TOK = [171508,78,9565,153716,159468,109017,294161,487826,18317708,47970978,194970130,124310472,84507828,69702872,87164035];
+const TPS = [10.5,null,21.1,25.0,23.7,17.8,24.8,39.9,24.6,53.7,36.5,15.7,9.4,20.2,59.0];
+const TTFT = [6953,5153,27951,36344,20273,14948,66944,2943,11523,2218,2170,7472,65550,9509,1239];
+
+function add(name, opts, size, theme) {
+  cases.push({ name, opts, size: size || [600, 190], theme: theme || 'dark' });
+}
+
+const bars = (arr, dates) => arr.map((v, i) => ({ t: (dates || D15)[i] || ('11-' + i), v }));
+
+add('dayTok 真实数据（11-21 为最高柱）', { kind: 'bar', color: '--blue', fmtV: tokY, unit: 'token', data: bars(TOK) }, [1106, 230]);
+add('dayTok 浅色主题', { kind: 'bar', color: '--blue', fmtV: tokY, unit: 'token', data: bars(TOK) }, [1106, 230], 'light');
+add('dayTps 含 null', { kind: 'bar', color: '--green', fmtV: tpsY, unit: 'tok/s', ref: { value: 20.8, label: '均值' }, data: bars(TPS) }, [500, 190]);
+add('dayTtft 毫秒→秒', { kind: 'bar', color: '--amber', fmtV: msY, unit: '首 token', ref: { value: 15000, label: '均值' }, data: bars(TTFT) }, [500, 190]);
+add('line 含 null 断线', { kind: 'line', color: '--blue', fmtV: tpsY, unit: 'tok/s', data: bars(TPS) }, [600, 190]);
+add('空数据', { kind: 'bar', color: '--blue', fmtV: tokY, data: [] });
+add('单点柱', { kind: 'bar', color: '--blue', fmtV: tokY, data: [{ t: '11-25', v: 42 }] });
+add('单点折线', { kind: 'line', color: '--blue', fmtV: tokY, data: [{ t: '11-25', v: 42 }] });
+add('全零', { kind: 'bar', color: '--blue', fmtV: tokY, data: bars(TOK.map(() => 0)) });
+add('超大值 1.2e9', { kind: 'bar', color: '--blue', fmtV: tokY, data: bars([1.2e9, 3.4e6, 8e8, 1, 2]) });
+add('极小值', { kind: 'bar', color: '--blue', fmtV: tokY, data: bars([3, 1, 2]) });
+add('全部相等', { kind: 'bar', color: '--green', fmtV: tpsY, data: bars(TOK.map(() => 50)) });
+add('60 天（标签抽稀）', { kind: 'bar', color: '--blue', fmtV: tokY, data: bars(Array.from({ length: 60 }, (_, i) => 1000 + i * 333)) }, [1106, 230]);
+add('均值高于所有柱', { kind: 'bar', color: '--green', fmtV: tpsY, ref: { value: 999, label: '均值' }, data: bars([5, 10, 7, 3]) });
+add('窄容器 260px', { kind: 'bar', color: '--blue', fmtV: tokY, data: bars(TOK) }, [260, 190]);
+add('NaN / Infinity / null', { kind: 'bar', color: '--blue', fmtV: tokY, data: bars([NaN, Infinity, null, 100, -50, undefined]) });
+add('长标签', { kind: 'bar', color: '--blue', fmtV: tokY, data: [{ t: '2026-11-21T10:00', v: 5 }, { t: '2026-11-22T11:00', v: 9 }] }, [400, 190]);
+add('负数', { kind: 'bar', color: '--blue', fmtV: tokY, data: bars([-5, 10, 0, 20]) });
+
+function measure(el) {
+  const vb = el.getAttribute('viewBox').split(' ').map(Number);
+  const W = vb[2], H = vb[3];
+  const issues = [];
+  const texts = [...el.querySelectorAll('text')];
+  const boxes = [];
+  texts.forEach(t => {
+    const b = t.getBBox();
+    const txt = t.textContent;
+    boxes.push({ txt, b, fill: t.getAttribute('fill'), fs: t.getAttribute('font-size') });
+    if (!isFinite(b.x) || !isFinite(b.y)) issues.push('NaN bbox: "' + txt + '"');
+    else if (b.x < -1 || b.y < -1 || b.x + b.width > W + 1 || b.y + b.height > H + 1)
+      issues.push('出界: "' + txt + '" x=' + b.x.toFixed(1) + ' y=' + b.y.toFixed(1) + ' w=' + b.width.toFixed(1) + ' h=' + b.height.toFixed(1) + ' / 画布 ' + W + 'x' + H);
+    if (b.width < 1) issues.push('零宽文字: "' + txt + '"');
+  });
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) {
+      const A = boxes[i].b, B = boxes[j].b;
+      const ox = Math.min(A.x + A.width, B.x + B.width) - Math.max(A.x, B.x);
+      const oy = Math.min(A.y + A.height, B.y + B.height) - Math.max(A.y, B.y);
+      if (ox > 1.5 && oy > 1.5)
+        issues.push('重叠: "' + boxes[i].txt + '" × "' + boxes[j].txt + '" (' + ox.toFixed(1) + '×' + oy.toFixed(1) + ')');
+    }
+  }
+  [...el.querySelectorAll('rect')].forEach(r => {
+    if (r.getAttribute('class') === 'hvbar') return;
+    const x = +r.getAttribute('x'), y = +r.getAttribute('y'), w = +r.getAttribute('width'), h = +r.getAttribute('height');
+    if (![x, y, w, h].every(isFinite)) issues.push('矩形含 NaN');
+    else if (w < 0 || h < 0) issues.push('矩形尺寸为负 ' + w + '×' + h);
+    else if (x < -1 || y < -1 || x + w > W + 1 || y + h > H + 1) issues.push('矩形出界');
+  });
+  return { issues, boxes, W, H };
+}
+
+function run() {
+  const w = document.getElementById('f').contentWindow;
+  const doc = w.document;
+  const fails = [];
+  let checked = 0;
+
+  cases.forEach(c => {
+    const id = 'ts' + (++seq);
+    const el = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    el.setAttribute('id', id);
+    el.setAttribute('class', 'chart');
+    el.style.cssText = 'display:block;width:' + c.size[0] + 'px;height:' + c.size[1] + 'px';
+    doc.body.appendChild(el);
+    w.applyTheme(c.theme, false);
+    try {
+      w.chart(id, c.opts);
+      const r = measure(el);
+      checked++;
+      if (r.issues.length) {
+        fails.push(c.name);
+        log.push('FAIL ' + c.name + ' [' + c.size.join('×') + ', ' + c.theme + ']');
+        r.issues.slice(0, 6).forEach(i => log.push('     · ' + i));
+        if (r.issues.length > 6) log.push('     · …共 ' + r.issues.length + ' 处');
+      } else {
+        log.push('ok   ' + c.name + ' [' + c.size.join('×') + ', ' + c.theme + ']');
+      }
+    } catch (e) {
+      fails.push(c.name);
+      log.push('FAIL ' + c.name + ' — 抛异常: ' + (e && e.message));
+    }
+  });
+
+  /* 专项：11-21 那根最高柱的数字必须落在柱内且为深色（深色主题） */
+  w.applyTheme('dark', false);
+  const id = 'ts' + (++seq);
+  const el = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  el.setAttribute('id', id);
+  el.setAttribute('class', 'chart');
+  el.style.cssText = 'display:block;width:1106px;height:230px';
+  doc.body.appendChild(el);
+  w.chart(id, { kind: 'bar', color: '--blue', fmtV: tokY, data: bars(TOK) });
+  const want = tokY(TOK[10]);
+  const t = [...el.querySelectorAll('text')].find(x => x.textContent === want);
+  if (!t) {
+    fails.push('11-21 标签缺失');
+    log.push('FAIL 11-21 标签 "' + want + '" 没渲染出来');
+  } else {
+    const b = t.getBBox();
+    const rects = [...el.querySelectorAll('rect')].filter(r => r.getAttribute('class') !== 'hvbar');
+    const bar = rects[10];
+    const bx = +bar.getAttribute('x'), by = +bar.getAttribute('y'), bw2 = +bar.getAttribute('width');
+    const inside = b.x >= bx - 1 && b.x + b.width <= bx + bw2 + 1 && b.y >= by - 1;
+    const fill = t.getAttribute('fill');
+    log.push('11-21 标签 "' + want + '": y=' + b.y.toFixed(1) + ' 柱顶=' + by.toFixed(1) +
+             ' 柱内=' + inside + ' 颜色=' + fill + ' 字重=' + t.getAttribute('font-weight'));
+    if (!inside) { fails.push('11-21 标签不在柱内'); }
+    if (fill !== '#0b1220') { fails.push('11-21 标签对比色不对'); }
+  }
+
+  document.getElementById('out').textContent =
+    log.join('\n') + '\n\n共 ' + checked + ' 个用例，失败 ' + fails.length + ' 个' +
+    (fails.length ? '：' + fails.join(' / ') : '');
+  document.title = 'SELFTEST checked=' + checked + ' failed=' + fails.length;
+}
+
+window.onerror = (m, s, l) => {
+  document.getElementById('out').textContent = 'HARNESS ERROR: ' + m + ' @' + l;
+  document.title = 'SELFTEST ERROR';
+};
+setTimeout(run, 1500);
+</script>
+</body>
+</html>
