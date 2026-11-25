@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
 		/* 直连回退用的端口；看板换端口时改这里，或让宿主用 USTC_MONITOR_PORT 代理 */
 		const DIRECT = "http://127.0.0.1:8790/api/summary";
 		const DASHBOARD = "http://127.0.0.1:8790/";
-		const REFRESH_MS = 10000;
+		const REFRESH_MS = 5000;
 
 		const readJson = async (url) => {
 			const res = await fetch(url, { cache: "no-store" });

@@ -107,7 +107,7 @@ curl.exe -s http://127.0.0.1:8790/api/summary | ConvertFrom-Json | Select last_e
 - `GET /key/info` — 预算窗口、重置时间、rpm 限额
 
 采集策略：启动时增量拉第 1 页（遇到已知 `request_id` 即停），每 10s 一轮，
-每 30 分钟全量对齐一次；只读、单连接、失败退避。
+每 30 分钟全量对齐一次；看板与客户端状态条每 5s 刷新一次；只读、单连接、失败退避。
 
 账单拉取遇到平台偶发 5xx / 429 / 网络抖动时，**同一轮内最多重试 3 次**
 （间隔 0 / 1.5s / 4s），三次都失败才在看板标红，并把错误翻成人话
@@ -190,7 +190,7 @@ msedge --headless=new --virtual-time-budget=20000 --dump-dom http://127.0.0.1:87
 plugin/                     插件源码
   package.json              dsh.client 声明
   lib/index.js              宿主半：注册 GET /ustc-token/summary 代理本地监测器
-  lib/client.js             浏览器半：聊天头部状态条（每 10s 刷新）
+  lib/client.js             浏览器半：聊天头部状态条（每 5s 刷新）
 install-plugin.ps1          安装/更新/卸载到 DSH profile
 ```
 

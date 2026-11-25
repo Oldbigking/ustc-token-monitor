@@ -357,6 +357,13 @@ function chart(id, opts) {
     fmtV: opts.s2.fmtV || (v => fmt(v)),
     unit: opts.s2.unit || '',
   } : null;
+
+  /* 多序列自适应高度：1 条序列用基准高度，每多一条 +72px，双轴图不再挤在一起 */
+  const seriesCount = 1 + (st.s2 ? 1 : 0);
+  const baseH = st.el.closest('.one') ? 230 : 190;
+  const autoH = baseH + (seriesCount - 1) * 72;
+  if (st.el.style.height !== autoH + 'px') st.el.style.height = autoH + 'px';
+
   draw(id);
 }
 
@@ -672,6 +679,7 @@ function initGap() {
   sel.value = String(v);
   sel.addEventListener('change', () => {
     const next = parseInt(sel.value, 10) || 30;
+    GAP_MIN = next;                       // 关键：立刻生效，tick() 才会带新阈值请求
     localStorage.setItem('gapMin', String(next));
     const q = new URLSearchParams(location.search);
     q.set('gap', String(next));
@@ -854,7 +862,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 applyTheme(mode, false);
 GAP_MIN = initGap();
 tick();
-setInterval(tick, 10000);
+setInterval(tick, 5000);
 </script>
 </body>
 </html>
