@@ -218,6 +218,51 @@ function run() {
   log.push('双轴悬停: ' + JSON.stringify(tipText) + ' → ' + (okTip ? 'ok（含 ' + want1 + ' 与 ' + want2 + '）' : 'FAIL'));
   if (!okTip) fails.push('双轴悬停提示');
 
+  /* 专项：两张同组图横轴对齐 + 悬停联动 + 共用提示（每日图表就是这套） */
+  const mkSvg = id2 => {
+    const e = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    e.setAttribute('id', id2);
+    e.setAttribute('class', 'chart');
+    e.style.cssText = 'display:block;width:800px;height:190px';
+    doc.body.appendChild(e);
+    return e;
+  };
+  w.applyTheme('dark', false);
+  const pad = { l: 58, r: 52 };
+  const sharedTip = i => '<div class="k">day ' + i + '</div>' +
+    '<div><b>TOK' + TOK[i] + '</b></div><div><b>TPS' + TPS[i] + '</b></div>';
+  const eA = mkSvg('synA'), eB = mkSvg('synB');
+  w.chart('synA', { kind: 'bar', color: '--blue', fmtV: tokY, pad, sync: 'd', tip: sharedTip, data: bars(TOK) });
+  w.chart('synB', { kind: 'line', color: '--green', fmtV: tpsY, pad, sync: 'd', tip: sharedTip, data: bars(TPS) });
+
+  const Wa = +eA.getAttribute('viewBox').split(' ')[2];
+  const Wb = +eB.getAttribute('viewBox').split(' ')[2];
+  const rectsA = [...eA.querySelectorAll('rect')];
+  const labA = +eA.querySelector('text[text-anchor="end"]').getAttribute('x');
+  const labB = +eB.querySelector('text[text-anchor="end"]').getAttribute('x');
+  const bwA = rectsA.length > 1 ? +rectsA[1].getAttribute('x') - +rectsA[0].getAttribute('x') : NaN;
+  const pls = [...eB.querySelectorAll('polyline')]
+    .map(p => p.getAttribute('points').trim().split(/\s+/).map(s => +s.split(',')[0]));
+  const best = pls.sort((a, b) => b.length - a.length)[0] || [];
+  const bwB = best.length > 1 ? Math.abs(best[1] - best[0]) : NaN;
+  eA.dispatchEvent(new w.MouseEvent('mousemove', {
+    clientX: eA.getBoundingClientRect().left + pad.l + (Wa - pad.l - pad.r) / TOK.length * (4.5),
+    clientY: eA.getBoundingClientRect().top + 100, bubbles: true,
+  }));
+  const hovA = eA.querySelector('.hov'), hovB = eB.querySelector('.hov');
+  const tip2 = (doc.getElementById('tip').textContent || '');
+  const okSync = hovA && hovA.style.display !== 'none' && hovB && hovB.style.display !== 'none';
+  const okTip2 = tip2.indexOf('TOK' + TOK[4]) >= 0 && tip2.indexOf('TPS' + TPS[4]) >= 0;
+  const okAlign = Wa === Wb && labA === labB && Math.abs(bwA - bwB) < 0.6;
+  log.push('联动 ' + JSON.stringify(tip2) + ' → ' +
+    (okSync ? '两者都有十字线' : 'FAIL 十字线缺失') + ' / ' +
+    (okTip2 ? '提示含两图数值' : 'FAIL 提示缺数值') + ' / ' +
+    (okAlign ? '横轴对齐（L=' + (labA + 9) + ' bw=' + bwA.toFixed(1) + '）'
+             : 'FAIL 不对齐 L=' + labA + '/' + labB + ' bw=' + bwA + '/' + bwB));
+  if (!okSync) fails.push('联动十字线');
+  if (!okTip2) fails.push('联动提示');
+  if (!okAlign) fails.push('横轴对齐');
+
   document.getElementById('out').textContent =
     log.join('\n') + '\n\n共 ' + checked + ' 个用例，失败 ' + fails.length + ' 个' +
     (fails.length ? '：' + fails.join(' / ') : '');

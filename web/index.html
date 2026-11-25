@@ -270,6 +270,8 @@ function applyTheme(next, persist) {
 /* ================= 图表引擎 ================= */
 const CHARTS = {};
 const PAD = { l: 54, r: 14, t: 16, b: 26 };
+/* 两张每日图强制用同一组左右留白，横轴逐列对齐（悬停才能同时定位到同一天） */
+const DAY_PAD = { l: 58, r: 52 };
 const tipEl = document.createElement('div');
 tipEl.id = 'tip';
 document.body.appendChild(tipEl);
@@ -327,12 +329,21 @@ function chart(id, opts) {
   if (!st) {
     const el = $(id);
     if (!el) return;
-    st = CHARTS[id] = { el, data: [], hov: -1, geom: null };
+    st = CHARTS[id] = { el, data: [], hov: -1, geom: null, id };
     new ResizeObserver(() => draw(id)).observe(el);
     el.addEventListener('mousemove', e => onHover(id, e));
-    el.addEventListener('mouseleave', () => { st.hov = -1; paint(id); tipEl.style.display = 'none'; });
+    el.addEventListener('mouseleave', () => {
+      st.hov = -1; paint(id); tipEl.style.display = 'none';
+      syncHover(st, -1);
+    });
   }
   st.kind = opts.kind || 'bar';
+  /* 固定左右留白：同组图共用同一组数值，横轴才能逐列对齐 */
+  st.pad = opts.pad || null;
+  /* 联动键：同一个 key 的图共享悬停列 */
+  st.sync = opts.sync || null;
+  /* 自定义提示框：同组图共用一个回调，悬停任意一张都能看到全部口径 */
+  st.tip = opts.tip || null;
   st.colorVar = opts.color;
   st.color = cssv(opts.color) || cssv('--green');
   st.fmtV = opts.fmtV || (v => fmt(v));
@@ -371,12 +382,14 @@ function draw(id) {
   const yText = [];
   for (let i = 0; i <= 4; i++) yText.push(String(st.fmtV(ymax * i / 4)));
   /* 左边距按最宽刻度动态计算，避免大数字被切掉 */
-  const L = Math.max(PAD.l, Math.ceil(Math.max.apply(null, yText.map(t => textW(t, 10.5)))) + 14);
+  let L = Math.max(PAD.l, Math.ceil(Math.max.apply(null, yText.map(t => textW(t, 10.5)))) + 14);
+  if (st.pad && st.pad.l) L = Math.max(L, st.pad.l);
 
   const nums2 = dual ? s2.data.map(d => Number(d.v)).filter(v => isFinite(v) && v > 0) : [];
   const ymax2 = dual ? niceMax(Math.max(0, ...nums2)) : 1;
   const y2Text = dual ? [0, 1, 2, 3, 4].map(i => String(s2.fmtV(ymax2 * i / 4))) : [];
-  const rpad = dual ? Math.ceil(Math.max.apply(null, y2Text.map(t => textW(t, 10.5)))) + 16 : PAD.r;
+  let rpad = dual ? Math.ceil(Math.max.apply(null, y2Text.map(t => textW(t, 10.5)))) + 16 : PAD.r;
+  if (st.pad && st.pad.r) rpad = Math.max(rpad, st.pad.r);
 
   const R = W - rpad;
   const pw = Math.max(24, R - L);
@@ -535,7 +548,7 @@ function draw(id) {
   s += '<g class="hov" style="display:none">' +
        '<rect class="hvbar" x="0" y="' + T + '" width="0" height="' + ph + '" fill="' + P.txt + '" opacity="0.06"/>' +
        '<line x1="0" y1="' + T + '" x2="0" y2="' + B + '" stroke="' + P.hover + '" stroke-width="1" stroke-dasharray="3 3"/>' +
-       (st.kind === 'bar' || dual
+       (st.kind === 'line'
          ? '<circle class="hvdot" data-s="0" cx="0" cy="' + T + '" r="3.5" fill="' + st.color +
            '" stroke="' + P.panel + '" stroke-width="1.5"/>'
          : '') +
@@ -546,6 +559,17 @@ function draw(id) {
   el.innerHTML = s;
   st.geom = { W, H, L, R, T, B, bw, n, yy, y2, dual, xs, ws };
   paint(id);
+}
+
+/* 同组图的悬停列联动：i = -1 表示全部清除 */
+function syncHover(st, i) {
+  if (!st.sync) return;
+  Object.keys(CHARTS).forEach(k => {
+    const o = CHARTS[k];
+    if (o === st || o.sync !== st.sync) return;
+    o.hov = i;
+    paint(k);
+  });
 }
 
 function paint(id) {
@@ -570,7 +594,7 @@ function paint(id) {
   }
   if (d.brk) { hov.querySelectorAll('.hvdot').forEach(c => { c.style.display = 'none'; }); return; }
   const series = [
-    { s: '0', y: g.yy, d },
+    st.kind === 'line' ? { s: '0', y: g.yy, d } : null,
     g.dual && st.s2 ? { s: '1', y: g.y2, d: st.s2.data[st.hov] } : null,
   ].filter(Boolean);
   hov.querySelectorAll('.hvdot').forEach(c => {
@@ -597,6 +621,18 @@ function onHover(id, e) {
     if (x < g.xs[k]) { i = Math.max(0, k - 1); break; }
   }
   if (i !== st.hov) { st.hov = i; paint(id); }
+  syncHover(st, i);
+  /* 同组图共用提示回调：悬停任意一张，一次给出两幅图的口径 */
+  if (st.tip) {
+    const html = st.tip(i);
+    if (!html) { tipEl.style.display = 'none'; return; }
+    tipEl.innerHTML = html;
+    tipEl.style.display = 'block';
+    const w0 = tipEl.offsetWidth, h0 = tipEl.offsetHeight;
+    tipEl.style.left = Math.min(window.innerWidth - w0 - 10, e.clientX + 16) + 'px';
+    tipEl.style.top = Math.max(10, e.clientY - h0 - 14) + 'px';
+    return;
+  }
   const d = st.data[i], d2 = st.s2 ? st.s2.data[i] : null;
   if (d && d.brk) {
     tipEl.innerHTML = '<div class="k">空档 · 无调用</div>' +
@@ -759,14 +795,28 @@ async function tick() {
   });
 
   const hist = d.history || [];
+  /* 两张每日图共用同一套左右留白 + 同一份提示内容，悬停任一张都能同时看到三个口径 */
+  const dayTip = i => {
+    const h = hist[i];
+    if (!h) return '';
+    const tps = h.tps === null || h.tps === undefined ? '–' : h.tps.toFixed(1);
+    const ttft = h.ttft_ms === null || h.ttft_ms === undefined ? '–' : fx.secY(h.ttft_ms);
+    return '<div class="k">' + esc(h.date) + ' · ' + h.req + ' 次</div>' +
+      '<div><b>' + fx.tokY(h.tokens) + '</b> <span class="k">token</span></div>' +
+      '<div><b>' + tps + '</b> <span class="k">tok/s</span></div>' +
+      '<div><b>' + ttft + '</b> <span class="k">首 token</span></div>' +
+      '<div class="k">费用 ' + Number(h.spend || 0).toFixed(2) + '</div>';
+  };
   chart('chartDayTok', {
     kind: 'bar', color: '--blue', fmtV: fx.tokY, unit: 'token', ref: null,
+    pad: DAY_PAD, sync: 'daily', tip: dayTip,
     data: hist.map(h => ({ t: h.date.slice(5), v: h.tokens,
       extra: h.req + ' 次 · 费用 ' + Number(h.spend || 0).toFixed(2) })),
   });
   chart('chartDayPerf', {
     kind: 'line', color: '--green', fmtV: fx.tpsY, unit: 'tok/s',
     ref: at.tps ? { value: at.tps, label: '均值' } : null,
+    pad: DAY_PAD, sync: 'daily', tip: dayTip,
     data: hist.map(h => ({ t: h.date.slice(5), v: h.tps,
       extra: h.req + ' 次 · ' + fmt(h.tokens) + ' token' })),
     s2: {
