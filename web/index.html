@@ -281,8 +281,10 @@ const palette = () => ({
 
 const fx = {
   tokY: v => v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? Math.round(v / 1e3) + 'k' : String(Math.round(v)),
-  tpsY: v => v >= 100 ? v.toFixed(0) : v.toFixed(1),
+  tpsY: v => (v % 1 ? v.toFixed(1) : v.toFixed(0)),
   msY: v => v >= 1000 ? (v / 1000).toFixed(1) + 's' : Math.round(v) + 'ms',
+  /* 纵轴统一用秒：避免一根轴上出现 0ms 与 25.0s 混排 */
+  secY: v => (v / 1000).toFixed(v % 1000 ? 1 : 0) + 's',
 };
 
 function niceMax(v) {
@@ -768,7 +770,7 @@ async function tick() {
     data: hist.map(h => ({ t: h.date.slice(5), v: h.tps,
       extra: h.req + ' 次 · ' + fmt(h.tokens) + ' token' })),
     s2: {
-      color: '--amber', fmtV: fx.msY, unit: '首 token',
+      color: '--amber', fmtV: fx.secY, unit: '首 token',
       data: hist.map(h => ({ t: h.date.slice(5), v: h.ttft_ms })),
     },
   });
