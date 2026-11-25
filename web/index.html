@@ -197,7 +197,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
 
   <section class="one">
     <div class="card">
-      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span><select id="gapSel" class="gapsel" title="空档折叠阈值：超过这个时长的空档会压成一个断点"><option value="5">空档 5m</option><option value="15">空档 15m</option><option value="30">空档 30m</option><option value="60">空档 1h</option><option value="180">空档 3h</option></select></h2>
+      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span><select id="gapSel" class="gapsel" title="空档折叠阈值：超过这个时长的空档会压成一个断点"><option value="10">空档 10m</option><option value="30">空档 30m</option></select></h2>
       <svg class="chart" id="chartMinute"></svg>
     </div>
   </section>
@@ -619,7 +619,7 @@ function onHover(id, e) {
 /* ================= 渲染 ================= */
 const QS = new URLSearchParams(location.search);
 let CURRENT_SOURCE = QS.get('source') || '';
-const GAP_CHOICES = [5, 15, 30, 60, 180];
+const GAP_CHOICES = [10, 30];
 function initGap() {
   const fromUrl = parseInt(QS.get('gap'), 10);
   const fromLs = parseInt(localStorage.getItem('gapMin'), 10);
