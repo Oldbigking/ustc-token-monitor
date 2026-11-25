@@ -196,7 +196,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
 
   <section class="one">
     <div class="card">
-      <h2>每分钟输出 token 与平均 tok/s<span class="hint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span></h2>
+      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span></h2>
       <svg class="chart" id="chartMinute"></svg>
     </div>
   </section>
@@ -564,7 +564,7 @@ function onHover(id, e) {
 }
 
 /* ================= 渲染 ================= */
-let CURRENT_SOURCE = '';
+let CURRENT_SOURCE = new URLSearchParams(location.search).get('source') || '';
 let LAST = null;
 
 function syncSources(d) {
@@ -653,13 +653,22 @@ async function tick() {
 
   /* 图表 */
   const minutes = d.minutes || [];
+  /* 近 60 分钟没有任何调用时，退回后端给的"末次调用结尾"窗口，别留一张空图 */
+  const hasRecent = minutes.some(m => m.req > 0);
+  const alt = d.minutes_alt;
+  const win = hasRecent ? minutes : (alt ? alt.minutes : []);
+  $('minuteHint').textContent = hasRecent
+    ? '近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）'
+    : alt
+      ? `近 1h 无调用 · 回退到 ${alt.start_local}–${alt.end_local}（末次 ${alt.last_call_local}）`
+      : '还没有调用记录';
   chart('chartMinute', {
     kind: 'bar', color: '--green', fmtV: fx.tokY, unit: '输出 token',
-    data: minutes.map(m => ({ t: m.t_local, v: m.completion,
+    data: win.map(m => ({ t: m.t_local, v: m.completion,
       extra: m.req + ' 次 · 入 ' + fmt(m.prompt) + ' / 出 ' + fmt(m.completion) })),
     s2: {
       color: '--blue', fmtV: fx.tpsY, unit: 'tok/s',
-      data: minutes.map(m => ({ t: m.t_local, v: m.tps })),
+      data: win.map(m => ({ t: m.t_local, v: m.tps })),
     },
   });
 

@@ -487,6 +487,26 @@ def summarize(window_hours=1.0, recent=12, source=None):
     minute_anchor = (now // 60) * 60 - 59 * 60
     minutes = bucket([r for r in rows if r["t0"] >= minute_anchor], 60, minute_anchor, 60)
 
+    # 近 60 分钟一次调用都没有时，整张图只剩网格线。这里退回"以最后一次调用
+    # 结尾"的 60 分钟窗口，让闲置时也能看到最后一次活动长什么样。
+    minutes_alt = None
+    if not any(m["req"] for m in minutes):
+        last_any = max((r["t0"] for r in allrows), default=None)
+        if last_any is not None:
+            # 末次调用可能是个 0 输出的空转请求，那样整窗还是空的；优先锚在有输出的那次
+            pos = [r["t0"] for r in allrows if (r["completion"] or 0) > 0]
+            anchor_at = max(pos) if pos else last_any
+            alt_end = (int(anchor_at) // 60 + 1) * 60
+            alt_anchor = alt_end - 3600
+            minutes_alt = {
+                "minutes": bucket([r for r in allrows if r["t0"] >= alt_anchor],
+                                  60, alt_anchor, 60),
+                "start_local": local(alt_anchor).strftime("%m-%d %H:%M"),
+                "end_local": local(alt_end).strftime("%m-%d %H:%M"),
+                "last_call_local": local(last_any).strftime("%m-%d %H:%M"),
+                "idle_s": int(now - last_any),
+            }
+
     hour_anchor = day_start
     hours = bucket(rows, 3600, hour_anchor, 24)
 
@@ -576,6 +596,7 @@ def summarize(window_hours=1.0, recent=12, source=None):
         "ttft_ms": round(ttft_ms) if ttft_ms else None,
         "budgets": budgets,
         "minutes": minutes,
+        "minutes_alt": minutes_alt,
         "hours": hours,
         "history": history,
         "alltime": alltime,
