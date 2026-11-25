@@ -1,0 +1,15 @@
+# 本地运行数据（个人用量、费用）
+usage.db
+usage.db-*
+*.db-wal
+*.db-shm
+
+# 运行日志与临时产物
+*.log
+dom*.html
+dump*.html
+__pycache__/
+*.pyc
+
+# 从 DSH 安装包反解出来的内部代码，不对外发布
+tools/

@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+USTC 大模型平台 Token 速率监测器
+--------------------------------
+数据源: LiteLLM Proxy 只读账单接口 (/spend/logs/v2, /key/info)
+指标  : 平均生成速度 (tok/s)、1h 用量、3h/12h 限额进度、全天用量与费用
+
+用法:
+  python monitor.py --once           # 采集一轮并打印摘要，用于核对
+  python monitor.py --serve          # 常驻采集 + 看板 http://127.0.0.1:8790
+  python monitor.py --serve --port 9000
+
+依赖: 仅 Python 标准库 (3.9+)
+密钥: 环境变量 USTC_API_KEY，缺失时回退读取 ~/.dsh/.credentials.yaml，仅驻留内存
+"""
+
+import argparse
+import collections
+import json
+import os
+import re
+import socket
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BASE = "https://api.llm.ustc.edu.cn"
+TZ = timezone(timedelta(hours=8))          # Asia/Shanghai (无夏令时)
+POLL_SECONDS = 10
+BUDGET_REFRESH_SECONDS = 60
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(HERE, "usage.db")
+
+MASK = lambda k: (k[:3] + "..." + k[-4:]) if k and len(k) > 10 else "***"
+
+
+# --------------------------------------------------------------------------- #
+# 工具
+# --------------------------------------------------------------------------- #
+def parse_ts(s):
+    """解析 LiteLLM 时间戳为 UTC epoch 秒。支持 Z / +00:00 / 6 位以上小数。"""
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    m = re.match(r"^(.*\.)(\d+)([+-]\d{2}:\d{2})$", s)
+    if m:  # 统一小数位到 6 位
+        frac = (m.group(2) + "000000")[:6]
+        s = m.group(1) + frac + m.group(3)
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
+def fmt_int(n):
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(n)
+
+
+def local(epoch):
+    return datetime.fromtimestamp(epoch, TZ)
+
+
+def load_key():
+    key = os.environ.get("USTC_API_KEY", "").strip()
+    if key:
+        return key, "env"
+    path = os.path.expanduser("~/.dsh/.credentials.yaml")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            m = re.search(r"USTC_API_KEY:\s*[\"']?(sk-[A-Za-z0-9_\-]+)", f.read())
+        if m:
+            return m.group(1), path
+    except OSError:
+        pass
+    return "", None
+
+
+KEY, KEY_SRC = load_key()
+
+
+_OPENER = None
+
+
+def _builder():
+    """默认绕过系统代理的 opener。
+
+    Windows 的 WinINET 代理（注册表 Internet Settings）会被 urllib 自动读走，
+    而 curl / DSH 只认环境变量，于是出现"curl 通、采集断"的怪象——系统代理
+    （如 Clash 7890）会重置到国内站点的连接。需要代理时设 USTC_PROXY。
+    """
+    global _OPENER
+    if _OPENER is None:
+        proxy = os.environ.get("USTC_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        _OPENER = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else {})
+        )
+    return _OPENER
+
+
+def api_get(path, params=None, timeout=25):
+    url = BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": "Bearer " + KEY, "Accept": "application/json"},
+    )
+    with _builder().open(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+# --------------------------------------------------------------------------- #
+# 存储
+# --------------------------------------------------------------------------- #
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS requests (
+    request_id TEXT PRIMARY KEY,
+    t0 REAL, t1 REAL, t2 REAL,
+    model TEXT, mgroup TEXT, prompt INTEGER, completion INTEGER,
+    cached INTEGER, reasoning INTEGER,
+    spend REAL, user_agent TEXT, finish TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_t0 ON requests(t0);
+CREATE TABLE IF NOT EXISTS budget_snap (
+    ts REAL PRIMARY KEY, payload TEXT
+);
+"""
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    with db() as c:
+        c.executescript(SCHEMA)
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(requests)")}
+        if "mgroup" not in cols:
+            c.execute("ALTER TABLE requests ADD COLUMN mgroup TEXT")
+        # 老数据没有 model_group，用 model 顶上（两者在平台上几乎总是同名）
+        c.execute("UPDATE requests SET mgroup = model WHERE mgroup IS NULL OR mgroup = ''")
+
+
+def upsert_rows(rows):
+    if not rows:
+        return 0
+    sql = """INSERT INTO requests
+             (request_id,t0,t1,t2,model,mgroup,prompt,completion,cached,reasoning,spend,user_agent,finish)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(request_id) DO UPDATE SET
+               t0=excluded.t0, t1=excluded.t1, t2=excluded.t2, model=excluded.model,
+               mgroup=excluded.mgroup,
+               prompt=excluded.prompt, completion=excluded.completion, cached=excluded.cached,
+               reasoning=excluded.reasoning, spend=excluded.spend,
+               user_agent=excluded.user_agent, finish=excluded.finish"""
+    with db() as c:
+        before = c.total_changes
+        c.executemany(sql, rows)
+        return c.total_changes - before
+
+
+def row_to_tuple(r):
+    meta = r.get("metadata") or {}
+    usage = meta.get("usage_object") or {}
+    pt = usage.get("prompt_tokens_details") or {}
+    ct = usage.get("completion_tokens_details") or {}
+    model = r.get("model") or r.get("model_group") or "?"
+    group = r.get("model_group") or model
+    return (
+        r.get("request_id"),
+        parse_ts(r.get("startTime")),
+        parse_ts(r.get("completionStartTime")),
+        parse_ts(r.get("endTime")),
+        model,
+        group,
+        int(r.get("prompt_tokens") or 0),
+        int(r.get("completion_tokens") or 0),
+        int(pt.get("cached_tokens") or 0),
+        int(ct.get("reasoning_tokens") or 0),
+        float(r.get("spend") or 0.0),
+        (meta.get("user_agent") or "")[:120],
+        r.get("finish_reason") or "",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 采集
+# --------------------------------------------------------------------------- #
+STATE = {
+    "last_ok": 0.0,
+    "last_err": None,
+    "polls": 0,
+    "rows": 0,
+    "budget": None,
+    "budget_ts": 0.0,
+    "key_info": None,
+}
+LOCK = threading.Lock()
+
+
+def fetch_rows(full=False, page_size=100, max_pages=12):
+    """增量拉取：默认只翻到"遇到已知 request_id"为止；full=True 时拉完整区间。"""
+    today = local(time.time()).date()
+    start = (today - timedelta(days=2)).isoformat()
+    end = (today + timedelta(days=2)).isoformat()
+    out, page = [], 1
+    while page <= max_pages:
+        j = api_get("/spend/logs/v2", {
+            "start_date": start, "end_date": end,
+            "page": page, "page_size": page_size,
+        })
+        data = j.get("data") or []
+        if not data:
+            break
+        out.extend(data)
+        if not full:
+            ids = [r.get("request_id") for r in data if r.get("request_id")]
+            if ids and known_count(ids) > 0:
+                break
+        if page >= int(j.get("total_pages") or 1):
+            break
+        page += 1
+    return out
+
+
+def backfill(start="2026-10-29"):
+    """按天回填全部历史请求行（平台按 UTC 解释日期，这里按 UTC 日切片即可）。"""
+    from datetime import date
+    d = date.fromisoformat(start)
+    today = local(time.time()).date()
+    total_new = 0
+    while d <= today:
+        nxt = (d + timedelta(days=1)).isoformat()
+        page, got = 1, 0
+        while page <= 80:
+            j = api_get("/spend/logs/v2", {
+                "start_date": d.isoformat(), "end_date": nxt,
+                "page": page, "page_size": 100,
+            })
+            data = j.get("data") or []
+            tuples = [row_to_tuple(r) for r in data if r.get("request_id")]
+            total_new += upsert_rows(tuples)
+            got += len(data)
+            if not data or page >= int(j.get("total_pages") or 1):
+                break
+            page += 1
+        if got:
+            print(f"  {d}  {got:>5} 行", flush=True)
+        d += timedelta(days=1)
+    print(f"回填完成，新增/更新 {total_new} 行")
+
+
+def known_count(ids):
+    if not ids:
+        return 0
+    q = "SELECT COUNT(*) FROM requests WHERE request_id IN (%s)" % ",".join("?" * len(ids))
+    with db() as c:
+        return c.execute(q, ids).fetchone()[0]
+
+
+def refresh_key_info():
+    info = api_get("/key/info")
+    d = info.get("info") or info
+    budgets = []
+    usage = d.get("budget_limits_usage") or {}
+    for b in (d.get("budget_limits") or []):
+        dur = b.get("budget_duration") or "?"
+        key = dur if dur in usage else None
+        cur = None
+        if key and isinstance(usage.get(key), dict):
+            cur = usage[key].get("current_spend")
+        budgets.append({
+            "window": dur,
+            "used": float(cur) if cur is not None else None,
+            "max": float(b.get("max_budget") or 0),
+            "reset_at": b.get("reset_at"),
+        })
+    with LOCK:
+        STATE["budget"] = budgets
+        STATE["budget_ts"] = time.time()
+        STATE["key_info"] = {
+            "alias": d.get("key_alias"),
+            "rpm": d.get("rpm_limit"),
+            "tpm": d.get("tpm_limit"),
+            "spend": d.get("spend"),
+            "status": d.get("status"),
+            "last_active": d.get("last_active"),
+        }
+
+
+def poll_once(verbose=True, full=False, force_full=None):
+    try:
+        now0 = time.time()
+        if force_full is not None:
+            full = force_full
+        else:
+            full = full or (now0 - STATE.get("last_full", 0) > 1800)
+        rows = fetch_rows(full=full)
+        tuples = [row_to_tuple(r) for r in rows if r.get("request_id")]
+        changed = upsert_rows(tuples)
+        now = time.time()
+        if full:
+            STATE["last_full"] = now
+        if now - STATE["budget_ts"] > BUDGET_REFRESH_SECONDS:
+            try:
+                refresh_key_info()
+            except Exception as e:  # 预算失败不阻断主采集
+                if verbose:
+                    print(f"  key/info 失败: {e}", file=sys.stderr)
+        with LOCK:
+            STATE.update(last_ok=now, last_err=None, polls=STATE["polls"] + 1,
+                         rows=len(tuples))
+        return changed
+    except Exception as e:
+        with LOCK:
+            STATE["last_err"] = f"{type(e).__name__}: {e}"
+            STATE["polls"] += 1
+        if verbose:
+            print(f"采集失败: {e}", file=sys.stderr)
+        return -1
+
+
+# --------------------------------------------------------------------------- #
+# 统计
+# --------------------------------------------------------------------------- #
+def group_of(r):
+    """来源名：优先 model_group，缺省退回 model。"""
+    return r.get("mgroup") or r.get("model") or "?"
+
+
+def build_sources(allrows):
+    """全部历史按来源聚合，用于看板下拉框。"""
+    agg_src = {}
+    for r in allrows:
+        name = group_of(r)
+        s = agg_src.setdefault(name, {"name": name, "req": 0, "tokens": 0,
+                                      "spend": 0.0, "last": 0.0})
+        s["req"] += 1
+        s["tokens"] += r["prompt"] + r["completion"]
+        s["spend"] += r["spend"]
+        s["last"] = max(s["last"], r["t0"])
+    out = []
+    for s in agg_src.values():
+        s["spend"] = round(s["spend"], 3)
+        s["last_local"] = local(s.pop("last")).strftime("%m-%d %H:%M")
+        out.append(s)
+    return sorted(out, key=lambda x: -x["tokens"])
+
+
+def summarize(window_hours=1.0, recent=12, source=None):
+    now = time.time()
+    day_start = local(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    w_start = now - window_hours * 3600
+    m5_start = now - 300
+
+    with db() as c:
+        day_rows = [dict(r) for r in c.execute(
+            "SELECT * FROM requests WHERE t0 >= ? ORDER BY t0 ASC", (day_start,)
+        )]
+        allrows = [dict(r) for r in c.execute("SELECT * FROM requests ORDER BY t0")]
+
+    sources = build_sources(allrows)
+    if source:
+        day_rows = [r for r in day_rows if group_of(r) == source]
+        allrows = [r for r in allrows if group_of(r) == source]
+    rows = day_rows
+
+    def agg(sel):
+        total = sum(r["prompt"] + r["completion"] for r in sel)
+        comp = sum(r["completion"] for r in sel)
+        dec = sum((r["t2"] - r["t1"]) for r in sel
+                  if r["t1"] and r["t2"] and r["t2"] > r["t1"] and r["completion"] > 0)
+        return {
+            "req": len(sel),
+            "prompt": sum(r["prompt"] for r in sel),
+            "completion": comp,
+            "total": total,
+            "cached": sum(r["cached"] for r in sel),
+            "spend": sum(r["spend"] for r in sel),
+            "decode_s": dec,
+            "tps": (comp / dec) if dec > 0 else None,
+        }
+
+    h1 = agg([r for r in rows if r["t0"] >= w_start])
+    m5 = agg([r for r in rows if r["t0"] >= m5_start])
+    day = agg(rows)
+
+    # 最近一次有调用的 5 分钟窗口：有活动就是滚动 5 分钟，空闲时回退到最后活跃的那 5 分钟
+    last_t0 = max((r["t0"] for r in rows), default=None)
+    if last_t0 is None:
+        m5a = {"req": 0, "tokens": 0, "total": 0, "tps": None, "idle_s": None,
+               "start_local": None, "end_local": None, "last_call_local": None}
+    else:
+        end = now if (now - last_t0) <= 300 else min(now, last_t0 + 60)
+        start = end - 300
+        a = agg([r for r in rows if start <= r["t0"] <= end])
+        m5a = {
+            "req": a["req"], "tokens": a["completion"], "total": a["total"],
+            "spend": a["spend"], "tps": a["tps"], "decode_s": a["decode_s"],
+            "idle_s": int(now - last_t0),
+            "start_local": local(start).strftime("%H:%M"),
+            "end_local": local(end).strftime("%H:%M"),
+            "last_call_local": local(last_t0).strftime("%H:%M:%S"),
+        }
+
+    # 首 token 延迟（仅 1h、有 t1 的请求）
+    ttf = [r["t1"] - r["t0"] for r in rows
+           if r["t0"] >= w_start and r["t1"] and r["t1"] >= r["t0"]]
+    ttft_ms = (sum(ttf) / len(ttf) * 1000) if ttf else None
+
+    # 分钟序列（最近 60 分钟 + 全天小时序列）
+    def bucket(sel, step, anchor, n):
+        out = [{"t": anchor + i * step, "prompt": 0, "completion": 0,
+                "dec": 0.0, "comp": 0, "req": 0} for i in range(n)]
+        for r in sel:
+            idx = int((r["t0"] - anchor) // step)
+            if 0 <= idx < n:
+                b = out[idx]
+                b["prompt"] += r["prompt"]
+                b["completion"] += r["completion"]
+                b["req"] += 1
+                if r["t1"] and r["t2"] and r["t2"] > r["t1"] and r["completion"] > 0:
+                    b["dec"] += r["t2"] - r["t1"]
+                    b["comp"] += r["completion"]
+        for b in out:
+            b["tps"] = (b["comp"] / b["dec"]) if b["dec"] > 0 else None
+            b["t_local"] = local(b["t"]).strftime("%H:%M")
+        return out
+
+    minute_anchor = (now // 60) * 60 - 59 * 60
+    minutes = bucket([r for r in rows if r["t0"] >= minute_anchor], 60, minute_anchor, 60)
+
+    hour_anchor = day_start
+    hours = bucket(rows, 3600, hour_anchor, 24)
+
+    # ---- 历史（全部已入库请求，按本地日聚合） ----
+    hist_map = {}
+    for r in allrows:
+        k = local(r["t0"]).date().isoformat()
+        h = hist_map.setdefault(k, {"date": k, "req": 0, "prompt": 0, "completion": 0,
+                                    "spend": 0.0, "dec": 0.0, "comp": 0,
+                                    "ttf": [], "cached": 0})
+        h["req"] += 1
+        h["prompt"] += r["prompt"]
+        h["completion"] += r["completion"]
+        h["cached"] += r["cached"]
+        h["spend"] += r["spend"]
+        if r["t1"] and r["t2"] and r["t2"] > r["t1"] and r["completion"] > 0:
+            h["dec"] += r["t2"] - r["t1"]
+            h["comp"] += r["completion"]
+        if r["t1"] and r["t1"] >= r["t0"]:
+            h["ttf"].append(r["t1"] - r["t0"])
+    history = []
+    for k in sorted(hist_map):
+        h = hist_map[k]
+        history.append({
+            "date": k,
+            "req": h["req"],
+            "tokens": h["prompt"] + h["completion"],
+            "spend": round(h["spend"], 3),
+            "tps": round(h["comp"] / h["dec"], 1) if h["dec"] > 0 else None,
+            "ttft_ms": round(sum(h["ttf"]) / len(h["ttf"]) * 1000) if h["ttf"] else None,
+        })
+
+    all_dec = sum(h["dec"] for h in hist_map.values())
+    all_comp = sum(h["comp"] for h in hist_map.values())
+    all_ttf = [x for h in hist_map.values() for x in h["ttf"]]
+    alltime = {
+        "days": len(hist_map),
+        "req": sum(h["req"] for h in hist_map.values()),
+        "tokens": sum(h["prompt"] + h["completion"] for h in hist_map.values()),
+        "spend": round(sum(h["spend"] for h in hist_map.values()), 3),
+        "tps": round(all_comp / all_dec, 1) if all_dec > 0 else None,
+        "ttft_ms": round(sum(all_ttf) / len(all_ttf) * 1000) if all_ttf else None,
+    }
+
+    with LOCK:
+        budgets = list(STATE["budget"] or [])
+        ki = dict(STATE["key_info"] or {})
+        st = {k: STATE[k] for k in ("last_ok", "last_err", "polls", "rows")}
+
+    for b in budgets:
+        ra = parse_ts(b["reset_at"]) if b["reset_at"] else None
+        b["reset_in_s"] = max(0, int(ra - now)) if ra else None
+        if b.get("used") is not None and b.get("max"):
+            b["pct"] = round(b["used"] / b["max"] * 100, 1)
+        else:
+            b["pct"] = None
+
+    recent_rows = sorted(rows, key=lambda r: r["t0"], reverse=True)[:recent]
+    recent_list = []
+    for r in recent_rows:
+        dec = (r["t2"] - r["t1"]) if (r["t1"] and r["t2"] and r["t2"] > r["t1"]) else 0
+        recent_list.append({
+            "time": local(r["t0"]).strftime("%H:%M:%S"),
+            "model": r["model"],
+            "prompt": r["prompt"],
+            "completion": r["completion"],
+            "cached": r["cached"],
+            "tps": round(r["completion"] / dec, 1) if dec > 0 and r["completion"] > 0 else None,
+            "ttft_ms": int((r["t1"] - r["t0"]) * 1000) if r["t1"] else None,
+            "dur_s": round((r["t2"] - r["t0"]), 1) if r["t2"] else None,
+            "spend": round(r["spend"], 6),
+            "finish": r["finish"],
+        })
+
+    return {
+        "now_local": local(now).strftime("%Y-%m-%d %H:%M:%S"),
+        "day_label": local(now).strftime("%Y-%m-%d"),
+        "source": source,
+        "sources": sources,
+        "poll": {
+            "last_ok_ago_s": int(now - st["last_ok"]) if st["last_ok"] else None,
+            "last_err": st["last_err"],
+            "polls": st["polls"],
+        },
+        "key": ki,
+        "h1": h1, "m5": m5, "m5a": m5a, "day": day,
+        "ttft_ms": round(ttft_ms) if ttft_ms else None,
+        "budgets": budgets,
+        "minutes": minutes,
+        "hours": hours,
+        "history": history,
+        "alltime": alltime,
+        "recent": recent_list,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 看板
+# --------------------------------------------------------------------------- #
+PAGE_PATH = os.path.join(HERE, "web", "index.html")
+_PAGE_CACHE = {"mtime": None, "html": ""}
+
+
+def page_html():
+    """每次请求按 mtime 校验，改完 index.html 刷新浏览器就生效，不用重启进程。"""
+    try:
+        mtime = os.path.getmtime(PAGE_PATH)
+    except OSError:
+        return "<!doctype html><meta charset=utf-8><h1>缺少 web/index.html</h1>"
+    if _PAGE_CACHE["mtime"] != mtime:
+        with open(PAGE_PATH, encoding="utf-8") as f:
+            _PAGE_CACHE["html"] = f.read()
+        _PAGE_CACHE["mtime"] = mtime
+    return _PAGE_CACHE["html"]
+
+
+
+class _Server(ThreadingHTTPServer):
+    """跳过 HTTPServer.server_bind 里的 getfqdn() 反查，避免 DNS 慢时启动卡死。"""
+    daemon_threads = True
+
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, body, ctype):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        # 允许 DSH 页面（另一个本地端口）直接读取
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_OPTIONS(self):
+        self._send(204, "", "text/plain")
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/api/summary":
+            STATE.setdefault("hits", collections.deque(maxlen=200)).append(
+                (time.time(), self.headers.get("User-Agent", "")[:60]))
+            source = (query.get("source") or [None])[0] or None
+            try:
+                body = json.dumps(summarize(source=source), ensure_ascii=False)
+                self._send(200, body, "application/json; charset=utf-8")
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}), "application/json")
+        elif parsed.path == "/api/hits":
+            hits = list(STATE.get("hits") or ())
+            self._send(200, json.dumps({
+                "count": len(hits),
+                "recent": [{"at": datetime.fromtimestamp(t).strftime("%H:%M:%S"),
+                            "ua": ua} for t, ua in hits[-20:]],
+            }, ensure_ascii=False), "application/json; charset=utf-8")
+        elif parsed.path in ("/", "/index.html"):
+            self._send(200, page_html(), "text/html; charset=utf-8")
+        else:
+            self._send(404, "not found", "text/plain")
+
+
+# --------------------------------------------------------------------------- #
+# 入口
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true", help="采集一轮并打印摘要")
+    ap.add_argument("--backfill", action="store_true", help="回填全部历史请求")
+    ap.add_argument("--serve", action="store_true", help="常驻采集并启动看板")
+    ap.add_argument("--port", type=int, default=8790)
+    ap.add_argument("--host", default="127.0.0.1")
+    args = ap.parse_args()
+
+    if not KEY:
+        print("未找到 API Key：请设置 USTC_API_KEY 环境变量", file=sys.stderr)
+        return 2
+
+    print(f"Key: {MASK(KEY)} (来源: {KEY_SRC})")
+    print(f"DB : {DB_PATH}")
+    init_db()
+    if args.backfill:
+        backfill()
+        return 0
+    poll_once(full=False, force_full=False)   # 先用增量把最新数据补进来看板立刻可用
+
+    if args.once:
+        poll_once(full=True)
+        s = summarize()
+        print(f"\n时间 {s['now_local']}")
+        print(f"1h  : {fmt_int(s['h1']['total'])} tok | 入 {fmt_int(s['h1']['prompt'])} "
+              f"出 {fmt_int(s['h1']['completion'])} | {s['h1']['req']} 次 | "
+              f"{s['h1']['tps'] and round(s['h1']['tps'],1)} tok/s | TTFT {s['ttft_ms']} ms")
+        print(f"5m  : {fmt_int(s['m5']['total'])} tok | {s['m5']['tps'] and round(s['m5']['tps'],1)} tok/s")
+        print(f"全天: {fmt_int(s['day']['total'])} tok | {s['day']['req']} 次 | 费用 {s['day']['spend']:.4f}")
+        for b in s["budgets"]:
+            print(f"限额 {b['window']:>3}: {b['used']}/{b['max']} ({b['pct']}%) "
+                  f"重置 {b['reset_in_s']}s 后")
+        return 0
+
+    if not args.serve:
+        ap.print_help()
+        return 0
+
+    # 单实例保护：Windows 下 SO_REUSEADDR 允许两个进程绑同一端口，
+    # 会出现旧实例抢答、看板与插件读到旧代码的诡异现象。
+    guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        guard.bind((args.host, args.port))
+    except OSError:
+        print(f"端口 {args.port} 已被占用，监测器可能已在运行", file=sys.stderr)
+        return 0
+    finally:
+        guard.close()
+
+    stop = threading.Event()
+
+    def loop():
+        while not stop.is_set():
+            t0 = time.time()
+            poll_once()
+            s = summarize()
+            print(f"[{local(time.time()).strftime('%H:%M:%S')}] "
+                  f"req={s['h1']['req']:>2} 1h={fmt_int(s['h1']['total']):>7} "
+                  f"tps={s['h1']['tps'] and round(s['h1']['tps'],1)} "
+                  f"day={fmt_int(s['day']['total']):>7} spend={s['day']['spend']:.3f}",
+                  flush=True)
+            stop.wait(max(1.0, POLL_SECONDS - (time.time() - t0)))
+
+    threading.Thread(target=loop, daemon=True).start()
+    srv = _Server((args.host, args.port), Handler)
+    print(f"看板: http://{args.host}:{args.port}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        stop.set()
+        print("\n已停止")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

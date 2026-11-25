@@ -1,0 +1,22 @@
+{
+  "name": "dsh-plugin-ustc-token",
+  "version": "1.0.0",
+  "private": true,
+  "description": "USTC 大模型平台 token 速率与用量（头部状态条）",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5"
+  }
+}
