@@ -305,6 +305,46 @@ def refresh_key_info():
         }
 
 
+TRANSIENT_RETRIES = (0.0, 1.5, 4.0)  # 秒；平台偶发 5xx 时在同一轮内重试
+
+
+def _transient(e):
+    """平台侧抖动（5xx / 限流 / 网络）值得当场重试，我们自己的 bug 不值得。"""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code >= 500 or e.code == 429
+    return isinstance(e, (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError))
+
+
+def _err_text(e):
+    """把异常翻成人话，看板状态栏直接用。"""
+    if isinstance(e, urllib.error.HTTPError):
+        hint = {401: "密钥无效", 403: "无权限", 429: "请求过快被限流",
+                502: "网关错误", 503: "平台暂时不可用", 504: "网关超时"}.get(e.code, "")
+        return f"平台返回 {e.code}" + (f"（{hint}）" if hint else "")
+    if isinstance(e, urllib.error.URLError):
+        return f"网络不可达：{e.reason}"
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return "请求超时"
+    return f"{type(e).__name__}: {e}"
+
+
+def _fetch_with_retry(full, verbose):
+    last = None
+    for i, delay in enumerate(TRANSIENT_RETRIES):
+        if delay:
+            time.sleep(delay)
+        try:
+            return fetch_rows(full=full)
+        except Exception as e:
+            last = e
+            if not _transient(e):
+                raise
+            if verbose and i + 1 < len(TRANSIENT_RETRIES):
+                print(f"  采集暂时失败（{_err_text(e)}），{TRANSIENT_RETRIES[i + 1]}s 后重试",
+                      file=sys.stderr)
+    raise last
+
+
 def poll_once(verbose=True, full=False, force_full=None):
     try:
         now0 = time.time()
@@ -312,7 +352,7 @@ def poll_once(verbose=True, full=False, force_full=None):
             full = force_full
         else:
             full = full or (now0 - STATE.get("last_full", 0) > 1800)
-        rows = fetch_rows(full=full)
+        rows = _fetch_with_retry(full, verbose)
         tuples = [row_to_tuple(r) for r in rows if r.get("request_id")]
         changed = upsert_rows(tuples)
         now = time.time()
@@ -330,10 +370,10 @@ def poll_once(verbose=True, full=False, force_full=None):
         return changed
     except Exception as e:
         with LOCK:
-            STATE["last_err"] = f"{type(e).__name__}: {e}"
+            STATE["last_err"] = _err_text(e)
             STATE["polls"] += 1
         if verbose:
-            print(f"采集失败: {e}", file=sys.stderr)
+            print(f"采集失败: {_err_text(e)}", file=sys.stderr)
         return -1
 
 

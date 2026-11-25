@@ -46,6 +46,11 @@ python monitor.py --backfill  :: 回填全部历史（一次性）
 采集策略：启动时增量拉第 1 页（遇到已知 `request_id` 即停），每 10s 一轮，
 每 30 分钟全量对齐一次；只读、单连接、失败退避。
 
+平台偶发 5xx / 429 / 网络抖动时，**同一轮内最多重试 3 次**（间隔 0 / 1.5s / 4s），
+三次都失败才在看板标红，并把错误翻成人话（`平台返回 503（平台暂时不可用）`
+`请求超时` `网络不可达：…`），不会再把裸 traceback 甩在状态栏上。离线用例：
+`python tests/test-retry.py`。
+
 > **代理坑**：Windows 的 WinINET 系统代理（注册表 `Internet Settings`）会被
 > Python `urllib` 自动继承，而 `curl` / DSH 只认环境变量。开着 Clash 之类的
 > 系统代理时，会出现 `curl` 能通、采集却报 `WinError 10054 连接被重置` 的怪象。
