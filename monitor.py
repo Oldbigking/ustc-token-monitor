@@ -240,10 +240,18 @@ def fetch_rows(full=False, page_size=100, max_pages=12):
     return out
 
 
-def backfill(start="2026-10-29"):
-    """按天回填全部历史请求行（平台按 UTC 解释日期，这里按 UTC 日切片即可）。"""
+DEFAULT_BACKFILL_START = "2026-10-29"
+
+
+def backfill(start=DEFAULT_BACKFILL_START):
+    """按天回填全部历史请求行（平台按 UTC 解释日期，这里按 UTC 日切片即可）。
+
+    start 为本地日期（YYYY-MM-DD），默认平台开通日 2026-10-29；可用 --since 覆盖。
+    """
     from datetime import date
-    d = date.fromisoformat(start)
+    if isinstance(start, str):
+        start = start.strip()
+    d = start if isinstance(start, date) else date.fromisoformat(start)
     today = local(time.time()).date()
     total_new = 0
     while d <= today:
@@ -643,7 +651,17 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30):
 # 看板
 # --------------------------------------------------------------------------- #
 PAGE_PATH = os.path.join(HERE, "web", "index.html")
+SELFTEST_PATH = os.path.join(HERE, "web", "_selftest.html")
 _PAGE_CACHE = {"mtime": None, "html": ""}
+
+
+def selftest_html():
+    """自检页由看板直接提供：部署完打开 /_selftest.html 就能跑用例，不用另起静态服务。"""
+    try:
+        with open(SELFTEST_PATH, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return "<!doctype html><meta charset=utf-8><h1>缺少 web/_selftest.html</h1>"
 
 
 def page_html():
@@ -718,6 +736,8 @@ class Handler(BaseHTTPRequestHandler):
             }, ensure_ascii=False), "application/json; charset=utf-8")
         elif parsed.path in ("/", "/index.html"):
             self._send(200, page_html(), "text/html; charset=utf-8")
+        elif parsed.path in ("/_selftest.html", "/_selftest"):
+            self._send(200, selftest_html(), "text/html; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain")
 
@@ -729,25 +749,47 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="采集一轮并打印摘要")
     ap.add_argument("--backfill", action="store_true", help="回填全部历史请求")
+    ap.add_argument("--since", default=DEFAULT_BACKFILL_START,
+                    help=f"配合 --backfill：起始日期 YYYY-MM-DD（默认 {DEFAULT_BACKFILL_START}）")
     ap.add_argument("--serve", action="store_true", help="常驻采集并启动看板")
-    ap.add_argument("--port", type=int, default=8790)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8790,
+                    help="看板端口（默认 8790；插件宿主默认也连 8790，换端口要同步设 USTC_MONITOR_PORT）")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="监听地址（默认仅本机 127.0.0.1）")
     args = ap.parse_args()
+
+    if args.backfill:
+        try:
+            datetime.strptime(args.since, "%Y-%m-%d")
+        except ValueError:
+            print(f"--since 需要 YYYY-MM-DD，收到 {args.since!r}", file=sys.stderr)
+            return 2
 
     if not KEY:
         print("未找到 API Key：请设置 USTC_API_KEY 环境变量", file=sys.stderr)
+        print("  PowerShell:  $env:USTC_API_KEY = 'sk-...'   （也可写进 ~/.dsh/.credentials.yaml）",
+              file=sys.stderr)
+        print("  Key 在平台门户 https://llm.ustc.edu.cn/ 的「API 密钥」页创建。", file=sys.stderr)
         return 2
 
     print(f"Key: {MASK(KEY)} (来源: {KEY_SRC})")
     print(f"DB : {DB_PATH}")
     init_db()
     if args.backfill:
-        backfill()
+        try:
+            backfill(args.since)
+        except Exception as e:
+            print(f"回填失败: {_err_text(e)}", file=sys.stderr)
+            return 1
         return 0
-    poll_once(full=False, force_full=False)   # 先用增量把最新数据补进来看板立刻可用
+    warm = poll_once(full=False, force_full=False)  # 先用增量把最新数据补进来看板立刻可用
 
     if args.once:
-        poll_once(full=True)
+        changed = poll_once(full=True)
+        if warm < 0 or changed < 0:
+            print(f"\n采集失败: {STATE['last_err']}", file=sys.stderr)
+            print("（Key 无效时看板仍能打开，但横幅会报 401、数据全 0）", file=sys.stderr)
+            return 1
         s = summarize()
         print(f"\n时间 {s['now_local']}")
         print(f"1h  : {fmt_int(s['h1']['total'])} tok | 入 {fmt_int(s['h1']['prompt'])} "
@@ -770,8 +812,9 @@ def main():
     try:
         guard.bind((args.host, args.port))
     except OSError:
-        print(f"端口 {args.port} 已被占用，监测器可能已在运行", file=sys.stderr)
-        return 0
+        print(f"端口 {args.port} 已被占用，监测器可能已在运行"
+              f"（换个端口：python monitor.py --serve --port 9000）", file=sys.stderr)
+        return 2
     finally:
         guard.close()
 

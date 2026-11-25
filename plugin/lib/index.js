@@ -3,11 +3,15 @@
  * browser half never depends on CORS or a fixed localhost port.
  *
  * Routes:
- *   GET /ustc-token/summary   -> proxy of http://127.0.0.1:8790/api/summary
+ *   GET /ustc-token/summary   -> proxy of http://127.0.0.1:<port>/api/summary
  *   GET /ustc-token/status    -> diagnostic: did the browser half call us?
+ *
+ * The monitor port defaults to 8790. If you start the dashboard on another port
+ * (`python monitor.py --serve --port 9000`), set USTC_MONITOR_PORT=9000 in the
+ * environment that launches DSH; the browser half talks to us, not to the port.
  */
-
-const UPSTREAM = "http://127.0.0.1:8790/api/summary";
+const MONITOR_PORT = Number.parseInt(process.env.USTC_MONITOR_PORT || "8790", 10) || 8790;
+const UPSTREAM = `http://127.0.0.1:${MONITOR_PORT}/api/summary`;
 
 export const inject = ["webServer"];
 

@@ -10,15 +10,78 @@
 1. **本地看板** `http://127.0.0.1:8790`
 2. **DSH 插件**：聊天界面头部的状态条 `⚡ 70.0 tok/s · 5m 2.3M`，点击打开看板
 
-## 快速开始
+---
 
-```bat
-start.bat                     :: 启动看板（默认已设为开机自启）
-python monitor.py --once      :: 采集一轮并打印摘要
-python monitor.py --backfill  :: 回填全部历史（一次性）
+## 0. 前置条件：一个 USTC 平台的 API Key
+
+监测器读的是你自己的账单，**没有 Key 什么都跑不起来**（会直接退出，退出码 2）。
+
+1. 打开平台门户 <https://llm.ustc.edu.cn/>，登录 → 「API 密钥」→ 创建 → 复制 `sk-...`
+2. 三选一配置（优先级从上到下）：
+
+   ```powershell
+   $env:USTC_API_KEY = 'sk-...'        # 当前窗口有效，最简单
+   setx USTC_API_KEY "sk-..."          # 永久，需新开窗口
+   ```
+
+   或写进 `~/.dsh/.credentials.yaml`（DSH 用户通常已经在那里）：
+
+   ```yaml
+   USTC_API_KEY: sk-...
+   ```
+
+3. 依赖：**Python 3.9+，仅标准库**，不需要 `pip install`。
+
+配错时的确切行为（照此判断，不用猜）：
+
+| 情况 | 现象 | 退出码 |
+|---|---|---|
+| 完全没配 Key | stderr 打出提示，不建库、不起服务 | `2` |
+| Key 无效（401） | 服务照常起来，看板顶部横幅 `采集异常：平台返回 401（密钥无效）`，数字全 0 | `--once` 退出 `1`；`--serve` 保持运行等修好 |
+| 端口被占用 | 提示换个端口后退出 | `2` |
+| 平台不可达 / 5xx 重试耗尽 | 看板横幅标红，人话错误 | `--once` 退出 `1` |
+
+## 1. 获取源码
+
+```powershell
+git clone https://github.com/Oldbigking/ustc-token-monitor.git
+cd ustc-token-monitor
 ```
 
-依赖：Python 3.9+，**仅标准库**。
+没有 git：打开仓库页面 → **Code → Download ZIP** → 解压到任意目录即可。
+
+## 2. 快速开始
+
+```bat
+start.bat                        :: 启动看板（Ctrl+C 停止；参数会透传给 monitor.py）
+start.bat --port 9000            :: 换个端口
+python monitor.py --once         :: 采集一轮并打印摘要（失败退出码 1）
+python monitor.py --backfill     :: 回填历史（默认从平台开通日 2026-10-29 起）
+python monitor.py --backfill --since 2026-11-01
+```
+
+启动后：
+
+```powershell
+curl.exe -s -o NUL -w "%{http_code}`n" http://127.0.0.1:8790/          # 200
+curl.exe -s http://127.0.0.1:8790/api/summary | ConvertFrom-Json | Select last_err
+```
+
+**只看改 `web/` 的前端改动**：服务端按 mtime 读取页面，刷新浏览器即生效，不用重启进程。
+
+> 端口：`--port`（默认 8790）、`--host`（默认 `127.0.0.1`，只监听本机）。
+> 插件宿主默认也连 8790；换端口时给 DSH 设 `USTC_MONITOR_PORT=9000` 即可，
+> 无需改插件代码（浏览器的直连回退仍写死 8790，但正常路径走同源代理）。
+
+## 3. 停止 / 更新 / 卸载
+
+- **停止**：前台 Ctrl+C；后台或自启的用 `taskkill /IM pythonw.exe /F`
+  （或任务管理器结束 `pythonw.exe`），再删开机启动项。
+- **更新**：`git pull`（或用新 ZIP 覆盖），重启 `--serve` 进程；只改前端则刷新浏览器。
+- **卸载**：结束进程 → 删除整个目录 → 如需彻底清理，删掉
+  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\USTC-Token-Monitor.vbs`；
+  装了插件再执行 `install-plugin.ps1 -Uninstall`。
+- **数据**：历史在目录下的 `usage.db`（SQLite），删掉即清空，重跑 `--backfill` 可重建。
 
 ## 指标口径
 
@@ -46,10 +109,11 @@ python monitor.py --backfill  :: 回填全部历史（一次性）
 采集策略：启动时增量拉第 1 页（遇到已知 `request_id` 即停），每 10s 一轮，
 每 30 分钟全量对齐一次；只读、单连接、失败退避。
 
-平台偶发 5xx / 429 / 网络抖动时，**同一轮内最多重试 3 次**（间隔 0 / 1.5s / 4s），
-三次都失败才在看板标红，并把错误翻成人话（`平台返回 503（平台暂时不可用）`
-`请求超时` `网络不可达：…`），不会再把裸 traceback 甩在状态栏上。离线用例：
-`python tests/test-retry.py`。
+账单拉取遇到平台偶发 5xx / 429 / 网络抖动时，**同一轮内最多重试 3 次**
+（间隔 0 / 1.5s / 4s），三次都失败才在看板标红，并把错误翻成人话
+（`平台返回 503（平台暂时不可用）` `请求超时` `网络不可达：…`），不会把裸 traceback
+甩在状态栏上。`/key/info` 不参与重试（失败只影响限额卡片，下次刷新再试）。
+离线用例：`python tests/test-retry.py`。
 
 > **代理坑**：Windows 的 WinINET 系统代理（注册表 `Internet Settings`）会被
 > Python `urllib` 自动继承，而 `curl` / DSH 只认环境变量。开着 Clash 之类的
@@ -102,19 +166,22 @@ python monitor.py --backfill  :: 回填全部历史（一次性）
 
 ## 图表自检
 
-`web/_selftest.html` 是浏览器内的回归用例集（18 个场景：空数据、单点、全零、
-超大值、NaN/Infinity/负数、60 天抽稀、窄容器、明暗双主题、均值高于所有柱…），
-用真实 `getBBox()` 检查文字出界/重叠、矩形越界：
+`web/_selftest.html` 是浏览器内的回归用例集（**30 个场景**：空数据、单点、全零、
+超大值、NaN/Infinity/负数、60 天抽稀、窄容器、明暗双主题、均值高于所有柱、
+折轴断点、双轴、两图联动…），用真实 `getBBox()` 检查文字出界/重叠、矩形越界，
+并在 `document.title` 里写结论。
+
+看板自己就会提供这一页，部署完直接打开：
 
 ```
-cd web && python -m http.server 8899
-# 浏览器打开 http://127.0.0.1:8899/_selftest.html 看报告
+python monitor.py --serve
+# 浏览器打开 http://127.0.0.1:8790/_selftest.html
 ```
 
-命令行版（headless Edge，`document.title` 里带结论）：
+命令行（headless Edge，取出 `<pre id="out">` 里的报告）：
 
 ```
-msedge --headless=new --virtual-time-budget=9000 --dump-dom http://127.0.0.1:8899/_selftest.html
+msedge --headless=new --virtual-time-budget=20000 --dump-dom http://127.0.0.1:8790/_selftest.html
 ```
 
 ## DSH 插件
@@ -124,41 +191,55 @@ plugin/                     插件源码
   package.json              dsh.client 声明
   lib/index.js              宿主半：注册 GET /ustc-token/summary 代理本地监测器
   lib/client.js             浏览器半：聊天头部状态条（每 10s 刷新）
-install-plugin.ps1          安装/更新到 DSH profile
+install-plugin.ps1          安装/更新/卸载到 DSH profile
 ```
 
-安装：`powershell -ExecutionPolicy Bypass -File install-plugin.ps1`。profile 补丁会热加载，
-状态条则要刷新一次窗口（`Ctrl+R`）才出现。新条目必须写成 `- insert:` 形式——
-直接写 `- id: <新条目>` 会被当成"覆盖已有条目"，目标不存在时整条被丢弃。
-插件会出现在会话头部右侧，与"在应用中打开""定时任务"按钮同一排。
-
+- 安装：`powershell -ExecutionPolicy Bypass -File install-plugin.ps1`
+- 卸载：`powershell -ExecutionPolicy Bypass -File install-plugin.ps1 -Uninstall`
+  （会删插件目录，并把 `cordis.patch.yml` 里整个 `ustc-token-badge` 的
+  `- insert:` 块一并移除；**不要手工只删 `- id:` 一行**，那会留下空的 `insert:` 让 YAML 失效）
+- profile 补丁热加载，状态条则要刷新一次窗口（`Ctrl+R`）才出现。
+- 脚本默认操作 `~/.dsh/profiles/desktop`，可用 `-Profile <名字>` / `-ProfileRoot <目录>` 指定。
+  profile 不存在时脚本会直接报错，不会留半装状态。
+- 新条目必须写成 `- insert:` 形式——直接写 `- id: <新条目>` 会被当成"覆盖已有条目"，
+  目标不存在时整条被丢弃。
 - 数据通道优先走同源代理 `/ustc-token/summary`，失败再直连 `127.0.0.1:8790`。
-- 卸载：删除 `~/.dsh/profiles/desktop/node_modules/dsh-plugin-ustc-token`
-  以及 `~/.dsh/profiles/desktop/cordis.patch.yml` 末尾的 `ustc-token-badge` 条目。
-- 若插件导致启动异常：删掉上述条目即可恢复，DSH 会跳过加载失败的条目。
+  看板换端口：给 DSH 设 `USTC_MONITOR_PORT=9000`（宿主代理会跟过去）。
+- 若插件导致启动异常：`install-plugin.ps1 -Uninstall` 后重启 DSH 即可恢复。
 
-## 开机自启
+## 开机自启（可选，仓库不含该文件）
+
+仓库里**没有** `.vbs`，也没有创建它的脚本——需要自启时自己建一个：
 
 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\USTC-Token-Monitor.vbs`
-用 `pythonw.exe` 无窗口启动 `monitor.py --serve`。删除该文件即可取消自启。
+
+```vbscript
+Set sh = CreateObject("WScript.Shell")
+sh.CurrentDirectory = "D:\path\to\ustc-token-monitor"
+sh.Run """pythonw.exe"" monitor.py --serve", 0, False
+```
+
+用 `pythonw.exe` 无窗口启动（`pythonw` 不在 PATH 时写全路径）。删除该文件即可取消自启。
+注意自启进程没有窗口，出错只能靠看板横幅或 `usage.db` 是否增长判断。
 
 ## 文件
 
 ```
-monitor.py        采集 + 统计 + JSON API（单文件，仅标准库）
-web/index.html    看板前端（明/暗主题、来源筛选、SVG 图表）
-usage.db          SQLite 历史库（`requests` 表，`request_id` 主键，幂等写入）
-plugin/           DSH 插件源码
-install-plugin.ps1
-start.bat         手动启动看板
-tests/            插件与宿主路由的冒烟测试（node --test 风格的手写断言）
+monitor.py            采集 + 统计 + JSON API（单文件，仅标准库）
+web/index.html        看板前端（明/暗主题、来源筛选、SVG 图表）
+web/_selftest.html    浏览器内图表回归用例（30 个场景，由看板直接提供）
+usage.db              SQLite 历史库（`requests` 表，`request_id` 主键，幂等写入）
+plugin/               DSH 插件源码
+install-plugin.ps1    插件安装/卸载
+start.bat             手动启动看板
+tests/                离线用例：test-retry.py（重试逻辑）、test-host.mjs（宿主路由）
 ```
 
 ## 注意
 
 - Key 从环境变量 `USTC_API_KEY` 读取，缺失时回退 `~/.dsh/.credentials.yaml`，
   只在内存中持有，日志里掩码显示为 `sk-...abcd`。
-- 看板只监听 `127.0.0.1`；`/api/summary` 允许任意来源读取（仅本机可访问）。
+- 看板只监听 `127.0.0.1`（`--host` 可改）；`/api/summary` 允许任意来源读取（仅本机可访问）。
 - 平台账单接口的 `start_date/end_date` 按 UTC 解释，脚本已按本地日重新过滤。
-- 限额卡片用平台 `current_spend`（实际扣减值），约半分钟批量更新一次，会阶梯式跳变。
+- 限额卡片用平台 `current_spend`（实际扣减值），**每 60s** 批量更新一次，会阶梯式跳变。
 - 监测器不调用 `/v1/chat/completions`，不占用 `rpm_limit=20` 的对话配额。

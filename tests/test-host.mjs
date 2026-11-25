@@ -1,5 +1,16 @@
-// 宿主半测试：注册路由并用假 req/res 调一次，确认能代理到本地监测器
-import { apply } from "../plugin/lib/index.js";
+// 宿主半测试：注册路由并用假 req/res 调一次，确认能代理到本地监测器。
+// 需要先启动看板：python monitor.py --serve
+// 看板不在 8790 时：node tests/test-host.mjs 9000  或  $env:USTC_MONITOR_PORT=9000
+const argPort = process.argv[2];
+if (argPort) process.env.USTC_MONITOR_PORT = argPort;
+const port = Number(process.env.USTC_MONITOR_PORT || 8790);
+try {
+  await fetch(`http://127.0.0.1:${port}/api/summary`, { cache: "no-store" });
+} catch {
+  console.log(`[skip] 127.0.0.1:${port} 上没有看板在跑，先执行 python monitor.py --serve`);
+  process.exit(0);
+}
+const { apply } = await import("../plugin/lib/index.js");
 
 let route;
 const ctx = {
