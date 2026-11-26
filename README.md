@@ -175,7 +175,19 @@ pythonw widget.py          :: 等价写法
 python  widget.py          :: 带控制台，便于看报错
 ```
 
-- 位置 / 迷你模式 / 透明度存 `%APPDATA%\ustc-token-monitor\widget.json`
+**配色**：默认白底。看板顶部有一排「浮窗」色块，点一下就把底色换成对应主题
+（白 / 米白 / 薄荷 / 天蓝 / 淡紫 / 浅灰 / 深色），小窗最多 5 秒内跟着变，不用重启：
+
+```
+GET  /api/widget                  -> {theme, colors, themes}
+POST /api/widget?theme=mint       -> 写入 %APPDATA%\ustc-token-monitor\widget.json
+```
+
+颜色是 monitor 写进配置文件的（`x/y/mini/alpha` 原样保留），小窗只读不写，
+所以看板和小窗同时开着也不会互相覆盖。想加新配色只需要在 `monitor.py` 的
+`WIDGET_THEMES` 里加一项，看板色块会自动多一个。
+
+- 位置 / 迷你模式 / 透明度 / 配色存 `%APPDATA%\ustc-token-monitor\widget.json`
 - 换端口：`python widget.py --api http://127.0.0.1:9000/api/summary`
 - **开机自启**：把 `start-widget.vbs` 复制到
   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`（`pythonw` 不在 PATH 时，

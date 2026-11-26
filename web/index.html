@@ -64,6 +64,15 @@ select,button{font:inherit;font-size:12.5px;color:var(--txt);background:var(--pa
 select:hover,button:hover{border-color:var(--line2)}
 select:focus-visible,button:focus-visible{outline:2px solid color-mix(in srgb,var(--blue) 45%,transparent);outline-offset:1px}
 .sel{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:12.5px}
+/* ---------- 悬浮小窗配色 ---------- */
+.wksel{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:12.5px;
+  padding:3px 8px 3px 9px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.wksel i{width:15px;height:15px;border-radius:50%;border:1px solid var(--line2);cursor:pointer;
+  display:inline-block;transition:transform .12s,outline-color .12s;outline:2px solid transparent;outline-offset:1px}
+.wksel i:hover{transform:scale(1.18)}
+.wksel i.on{outline-color:var(--blue)}
+.wksel .ok{color:var(--green);font-size:11.5px;min-width:0;opacity:0;transition:opacity .2s}
+.wksel .ok.show{opacity:1}
 
 /* ---------- 卡片 ---------- */
 .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
@@ -135,6 +144,9 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
     </div>
     <div class="tools">
       <span class="status"><i id="dot" class="dot"></i><span id="status">连接中…</span></span>
+      <span class="wksel" id="wksel" hidden title="桌面悬浮小窗的底色">
+        浮窗<span id="wkswatches"></span><b class="ok" id="wkok">已同步</b>
+      </span>
       <label class="sel">来源<select id="source"><option value="">总计</option></select></label>
       <button id="theme" title="主题：跟随系统 / 浅色 / 深色">◐ 自动</button>
     </div>
@@ -847,6 +859,61 @@ async function tick() {
   </tr>`).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--dim);padding:18px">暂无请求</td></tr>';
 }
 
+/* ================= 悬浮小窗配色 ================= */
+const WK = { themes: {}, cur: null };
+
+async function wkLoad() {
+  let d;
+  try {
+    d = await (await fetch('/api/widget', { cache: 'no-store' })).json();
+  } catch (e) {
+    return;                                   // 老版本监测器没有这个接口，安静隐藏
+  }
+  if (!d || !d.themes) return;
+  WK.themes = d.themes;
+  WK.cur = d.theme;
+  const box = $('wkswatches');
+  box.innerHTML = '';
+  for (const [k, t] of Object.entries(d.themes)) {
+    const i = document.createElement('i');
+    i.style.background = t.panel;
+    i.dataset.k = k;
+    i.title = (t.name || k) + (k === d.theme ? '（当前）' : '');
+    if (k === d.theme) i.className = 'on';
+    i.addEventListener('click', () => wkPick(k));
+    box.appendChild(i);
+  }
+  $('wksel').hidden = false;
+}
+
+async function wkPick(k) {
+  const ok = $('wkok');
+  let r, d;
+  try {
+    r = await fetch('/api/widget?theme=' + encodeURIComponent(k), { method: 'POST' });
+    d = await r.json();
+  } catch (e) {
+    ok.textContent = '失败';
+    ok.classList.add('show');
+    setTimeout(() => { ok.classList.remove('show'); ok.textContent = '已同步'; }, 1600);
+    return;
+  }
+  if (!r.ok || !d || !d.saved) {
+    ok.textContent = '失败';
+    ok.classList.add('show');
+    setTimeout(() => { ok.classList.remove('show'); ok.textContent = '已同步'; }, 1600);
+    return;
+  }
+  WK.cur = k;
+  document.querySelectorAll('#wkswatches i').forEach(el => {
+    el.classList.toggle('on', el.dataset.k === k);
+    const t = WK.themes[el.dataset.k] || {};
+    el.title = (t.name || el.dataset.k) + (el.dataset.k === k ? '（当前）' : '');
+  });
+  ok.classList.add('show');
+  setTimeout(() => ok.classList.remove('show'), 1400);
+}
+
 /* ================= 交互 ================= */
 $('theme').addEventListener('click', () => {
   applyTheme(MODES[(MODES.indexOf(mode) + 1) % MODES.length]);
@@ -861,6 +928,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 
 applyTheme(mode, false);
 GAP_MIN = initGap();
+wkLoad();
 tick();
 setInterval(tick, 5000);
 </script>

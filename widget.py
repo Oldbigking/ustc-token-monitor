@@ -38,19 +38,34 @@ def S(v):
     return int(round(v * SCALE))
 
 
-C = {
-    "bg": "#11151c",
-    "panel": "#161c25",
-    "txt": "#e9eff7",
-    "dim": "#8695a8",
-    "faint": "#5f6c7d",
-    "green": "#3ddc97",
-    "amber": "#ffb454",
-    "blue": "#5aa9ff",
-    "red": "#ff6b6b",
-    "track": "#232c39",
-    "accentbg": "#1d2531",
+# 默认浅色（白）。看板上选的颜色会经 monitor 的 /api/widget 写进
+# %APPDATA%\ustc-token-monitor\widget.json 的 colors 字段，小窗每 5 秒重读一次。
+LIGHT = {
+    "bg": "#ffffff",
+    "panel": "#ffffff",
+    "border": "#d3dae5",
+    "txt": "#16202c",
+    "dim": "#55606f",
+    "faint": "#7b8595",
+    "green": "#12915a",
+    "amber": "#b06a00",
+    "blue": "#1f6feb",
+    "red": "#cf2233",
+    "track": "#e7ecf3",
+    "accentbg": "#eef1f6",
 }
+C = dict(LIGHT)
+
+
+def apply_colors(colors):
+    """把看板下发的配色套上去；不认识的键忽略，缺的键回落默认浅色。"""
+    C.clear()
+    C.update(LIGHT)
+    if isinstance(colors, dict):
+        for k, v in colors.items():
+            if k in LIGHT and isinstance(v, str) and v.startswith("#"):
+                C[k] = v
+    return C
 
 
 def cfg_path():
@@ -188,11 +203,13 @@ class Widget:
         self.err = None
         self._busy = False
         self._items = {}
+        self._colors = cfg.get("colors")
+        apply_colors(self._colors)          # 看板选过的配色，开机即用
 
         self.W, self.H = self.size()
 
         root.overrideredirect(True)
-        root.configure(bg=C["bg"])
+        root.configure(bg=C["panel"])
         root.title("USTC Token")
         self._attr("-topmost", self.topmost)
         self._attr("-alpha", self.alpha)
@@ -203,7 +220,7 @@ class Widget:
         root.geometry(f"{self.W}x{self.H}+{int(x) if isinstance(x, int) else 60}"
                       f"+{int(y) if isinstance(y, int) else 60}")
 
-        self.cv = tk.Canvas(root, width=self.W, height=self.H, bg=C["bg"], highlightthickness=0, bd=0)
+        self.cv = tk.Canvas(root, width=self.W, height=self.H, bg=C["panel"], highlightthickness=0, bd=0)
         self.cv.pack(fill="both", expand=True)
         self.cv.bind("<Button-1>", self._drag_start)
         self.cv.bind("<B1-Motion>", self._drag_move)
@@ -308,17 +325,51 @@ class Widget:
             self.data, self.err = view(fetch(API_URL)), None
         except Exception as e:
             self.err = f"监测器未运行（{API_URL}）" if isinstance(e, urllib.error.URLError) else str(e)
+        # 看板选的配色随时可能变，每轮都重读配置（文件很小）
+        try:
+            cols = load_cfg().get("colors")
+        except Exception:
+            cols = None
+        if cols != self._colors:
+            self._colors = cols
+            apply_colors(cols)
+            self._repaint_bg()
         self._busy = False
         try:
             self.root.after(0, self.render)
         except Exception:
             pass
 
+    def _repaint_bg(self):
+        """换配色时把窗口/画布底色和右键菜单也跟上。"""
+        try:
+            self.root.configure(bg=C["panel"])
+            self.cv.configure(bg=self.cv_bg if self.rounded else C["panel"])
+            self.menu.configure(bg=C["panel"], fg=C["txt"],
+                                activebackground=C["accentbg"], activeforeground=C["txt"])
+        except Exception:
+            pass
+        self._items.clear()
+        self.cv.delete("all")
+
     # ---- 绘制 ---- #
     def _rr(self, x1, y1, x2, y2, r, **kw):
+        """底板多边形：复用同一个 item 并永远压在最底层。
+
+        早期版本每次刷新都 create_polygon 一个新的，新底板叠在文字上面，
+        于是卡片刷新一次就变成一块纯色（文字被盖住）。
+        """
         pts = (x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1)
-        return self.cv.create_polygon(pts, smooth=True, **kw)
+        it = self._items.get("panel")
+        if it is None:
+            it = self.cv.create_polygon(pts, smooth=True, **kw)
+            self._items["panel"] = it
+        else:
+            self.cv.coords(it, *pts)
+            self.cv.itemconfigure(it, **kw)
+        self.cv.tag_lower(it)
+        return it
 
     def _text(self, name, x, y, txt, font, fill, anchor="w"):
         it = self._items.get(name)
@@ -365,7 +416,9 @@ class Widget:
         if self.rounded:
             self.cv.configure(bg=self.cv_bg)
             r = S(11)
-            self._rr(0, 0, W, H, r, fill=C["panel"], outline=C["track"], width=1)
+            # 内缩 1px：描边完整落在画布内，外圈 1px 是透明色键（干净的圆角边）
+            self._rr(S(1), S(1), W - S(1), H - S(1), r,
+                     fill=C["panel"], outline=C["border"], width=1)
         else:
             self.cv.configure(bg=C["panel"])
 
@@ -485,6 +538,19 @@ def selftest():
     ok.append(("迷你尺寸", (wdg.W, wdg.H) == Widget.MINI, f"{wdg.W}x{wdg.H}"))
     ok.append(("迷你仍显示速度", t.get("tps") == "58.3", t.get("tps")))
     ok.append(("迷你不出界", not inside(), ";".join(inside())))
+
+    # 配色：看板下发的 colors 要能生效，非法键要忽略
+    apply_colors({"panel": "#fbf6ec", "txt": "#2a2418", "border": "#e3d9c6", "bogus": "#000000"})
+    wdg.mini = False
+    wdg.resize()
+    wdg.render(fix_full)
+    t = texts()
+    panel_fill = wdg.cv.itemcget(wdg._items["panel"], "fill")
+    ok.append(("换配色后文字仍在", t.get("tps") == "58.3", t.get("tps")))
+    ok.append(("配色生效（面板）", panel_fill == "#fbf6ec", panel_fill))
+    ok.append(("非法配色键被忽略", "bogus" not in C, C.get("bogus")))
+    apply_colors(None)                              # 复位默认浅色
+    ok.append(("复位为白底", C["panel"] == "#ffffff", C["panel"]))
 
     root.destroy()
 

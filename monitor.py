@@ -654,6 +654,88 @@ PAGE_PATH = os.path.join(HERE, "web", "index.html")
 SELFTEST_PATH = os.path.join(HERE, "web", "_selftest.html")
 _PAGE_CACHE = {"mtime": None, "html": ""}
 
+# --------------------------------------------------------------------------- #
+# 悬浮小窗的配色（看板选，小窗读）——浅色为主，最后一个给夜间用
+# --------------------------------------------------------------------------- #
+WIDGET_CFG_PATH = os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"), "ustc-token-monitor", "widget.json")
+
+WIDGET_THEMES = {
+    "paper": {"name": "白", "panel": "#ffffff", "border": "#d3dae5", "txt": "#16202c",
+              "dim": "#55606f", "faint": "#7b8595", "track": "#e7ecf3",
+              "green": "#12915a", "amber": "#b06a00", "blue": "#1f6feb", "red": "#cf2233"},
+    "cream": {"name": "米白", "panel": "#fbf6ec", "border": "#e3d9c6", "txt": "#2a2418",
+              "dim": "#6b6250", "faint": "#9a917c", "track": "#ece2cf",
+              "green": "#0f8a54", "amber": "#a86400", "blue": "#1c64c8", "red": "#c22626"},
+    "mint": {"name": "薄荷", "panel": "#eefaf3", "border": "#cfe7db", "txt": "#12281f",
+             "dim": "#4f6b5f", "faint": "#84a094", "track": "#d8ece2",
+             "green": "#0d8f58", "amber": "#a86500", "blue": "#1868c9", "red": "#c22a3a"},
+    "sky": {"name": "天蓝", "panel": "#eef5fd", "border": "#d0dfef", "txt": "#132437",
+            "dim": "#506275", "faint": "#8598ab", "track": "#dbe8f6",
+            "green": "#0f8a5a", "amber": "#a86500", "blue": "#1a63c8", "red": "#c22636"},
+    "lilac": {"name": "淡紫", "panel": "#f4f1fd", "border": "#ddd5f0", "txt": "#221c33",
+              "dim": "#5d5470", "faint": "#918aa3", "track": "#e7e1f6",
+              "green": "#0f8a58", "amber": "#a86400", "blue": "#5a49c8", "red": "#c22a4a"},
+    "gray": {"name": "浅灰", "panel": "#f3f5f8", "border": "#dde2e9", "txt": "#1a2029",
+             "dim": "#57606d", "faint": "#8b95a2", "track": "#e3e8ef",
+             "green": "#0f8a56", "amber": "#a46200", "blue": "#2a63c4", "red": "#c22636"},
+    "dark": {"name": "深色", "panel": "#161c25", "border": "#2a3542", "txt": "#e9eff7",
+             "dim": "#8695a8", "faint": "#5f6c7d", "track": "#232c39",
+             "green": "#3ddc97", "amber": "#ffb454", "blue": "#5aa9ff", "red": "#ff6b6b"},
+}
+DEFAULT_WIDGET_THEME = "paper"
+
+
+def _theme_colors(key):
+    t = dict(WIDGET_THEMES.get(key) or WIDGET_THEMES[DEFAULT_WIDGET_THEME])
+    t.pop("name", None)
+    return t
+
+
+def widget_cfg_read():
+    try:
+        with open(WIDGET_CFG_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def widget_cfg_write(d):
+    try:
+        os.makedirs(os.path.dirname(WIDGET_CFG_PATH), exist_ok=True)
+        tmp = WIDGET_CFG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, WIDGET_CFG_PATH)   # 原子替换，小窗不会读到半个文件
+        return True
+    except Exception as e:
+        print(f"写 widget 配置失败: {e}", file=sys.stderr)
+        return False
+
+
+def widget_payload():
+    cfg = widget_cfg_read()
+    key = cfg.get("theme")
+    if key not in WIDGET_THEMES:
+        key = DEFAULT_WIDGET_THEME
+    return {
+        "theme": key,
+        "colors": _theme_colors(key),
+        "themes": WIDGET_THEMES,
+        "path": WIDGET_CFG_PATH,
+    }
+
+
+def widget_set_theme(key):
+    if key not in WIDGET_THEMES:
+        return False
+    cfg = widget_cfg_read()
+    cfg["theme"] = key
+    cfg["colors"] = _theme_colors(key)
+    return widget_cfg_write(cfg)
+
+
 
 def selftest_html():
     """自检页由看板直接提供：部署完打开 /_selftest.html 就能跑用例，不用另起静态服务。"""
@@ -702,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         # 允许 DSH 页面（另一个本地端口）直接读取
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
         self.wfile.write(data)
@@ -727,6 +809,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, body, "application/json; charset=utf-8")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}), "application/json")
+        elif parsed.path == "/api/widget":
+            self._send(200, json.dumps(widget_payload(), ensure_ascii=False),
+                       "application/json; charset=utf-8")
         elif parsed.path == "/api/hits":
             hits = list(STATE.get("hits") or ())
             self._send(200, json.dumps({
@@ -740,6 +825,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, selftest_html(), "text/html; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path != "/api/widget":
+            self._send(404, "not found", "text/plain")
+            return
+        theme = (query.get("theme") or [None])[0]
+        if not theme:
+            try:                                  # 也接受 JSON body {"theme": "mint"}
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    theme = (json.loads(self.rfile.read(n).decode("utf-8")) or {}).get("theme")
+            except Exception:
+                theme = None
+        if theme not in WIDGET_THEMES:
+            self._send(400, json.dumps({"error": f"unknown theme: {theme!r}",
+                                        "themes": list(WIDGET_THEMES)},
+                                       ensure_ascii=False), "application/json; charset=utf-8")
+            return
+        ok = widget_set_theme(theme)
+        self._send(200 if ok else 500,
+                   json.dumps(dict(widget_payload(), saved=ok), ensure_ascii=False),
+                   "application/json; charset=utf-8")
 
 
 # --------------------------------------------------------------------------- #
