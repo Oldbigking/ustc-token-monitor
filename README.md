@@ -143,6 +143,47 @@ curl.exe -s http://127.0.0.1:8790/api/summary | ConvertFrom-Json | Select last_e
 鼠标悬停任意柱子/数据点会给出精确数值与当时的请求明细（双轴图一次给出两个数）。
 窗口小于 980px 时自动从两列变一列。
 
+## 桌面悬浮小窗（不用开 DSH，也不用开浏览器）
+
+`widget.py` 是一块**无边框、始终置顶**的小卡片，用 Python 自带的 tkinter 画出来
+（不依赖任何第三方库），贴在工作区角落，干别的事时瞟一眼就行：
+
+```
+┌────────────────────────────────────┐
+│ ▍23.8 tok/s                5m 6k   │
+│ 1h 3.5M · 23 次          首包 2.0s │
+│ 3h  ▓▓░░░░░░░░░░░░░░░░░  1.2/30    │
+│ 12h ▓▓░░░░░░░░░░░░░░░░░  1.2/70    │
+│ 13:59:29 · 6s 前   全天 13.4M ¥3.65 │
+└────────────────────────────────────┘
+```
+
+| 操作 | 效果 |
+|---|---|
+| 拖动 | 移位，位置记在配置里，下次启动原地出现 |
+| 双击 | 浏览器打开完整看板 |
+| 右键 | 菜单：打开看板 / 迷你模式（188×58）/ 始终置顶 / 退出 |
+| Ctrl + 滚轮 | 调透明度（0.35–1.0） |
+| 采集失败 | 左上圆点变红，底部给出人话错误（如 `⚠ 平台返回 503（平台暂时不可用）`） |
+| 空闲 | 右上角标 `7m 前`，速度显示最后一次活跃的 5 分钟窗口 |
+
+启动（需要监测器在跑，小窗只是 `/api/summary` 的只读客户端，不额外请求平台）：
+
+```bat
+start-widget.vbs           :: 无控制台启动（推荐，双击即可）
+pythonw widget.py          :: 等价写法
+python  widget.py          :: 带控制台，便于看报错
+```
+
+- 位置 / 迷你模式 / 透明度存 `%APPDATA%\ustc-token-monitor\widget.json`
+- 换端口：`python widget.py --api http://127.0.0.1:9000/api/summary`
+- **开机自启**：把 `start-widget.vbs` 复制到
+  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`（`pythonw` 不在 PATH 时，
+  按 vbs 里的注释改成 `pythonw.exe` 全路径）
+- **高 DPI**：按屏幕缩放整块等比放大（96 DPI = 1.0），字不会糊也不会撑破卡片
+- 自检：`python widget.py --selftest`（16 项布局/数值断言），
+  `python widget.py --dump` 打印当前真实数据的每个文本块与坐标
+
 ## 主题与来源
 
 - **明/暗双主题**：右上角按钮在 `自动 → 浅色 → 深色` 之间切换，选择存进
@@ -232,6 +273,8 @@ usage.db              SQLite 历史库（`requests` 表，`request_id` 主键，
 plugin/               DSH 插件源码
 install-plugin.ps1    插件安装/卸载
 start.bat             手动启动看板
+widget.py             桌面悬浮小窗（tkinter，仅标准库）
+start-widget.vbs      无控制台启动小窗（也可复制到启动目录做自启）
 tests/                离线用例：test-retry.py（重试逻辑）、test-host.mjs（宿主路由）
 ```
 
