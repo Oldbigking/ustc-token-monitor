@@ -185,12 +185,172 @@ def budget_text(b):
     return f"{b.get('used', 0):.1f}/{b.get('max', 0):.0f}", float(b.get("pct") or 0)
 
 
+# ------------------------------- 字体 ------------------------------- #
+# 目标：看起来像现在的控件——比例字体、够大的字号、圆角、hover 反馈。
+UI_FONTS = ("Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Tahoma")
+DISP_FONTS = ("Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI",
+              "Microsoft YaHei UI", "Tahoma")
+_FONTS = {"ui": None, "disp": None}
+
+
+def init_fonts():
+    """选本机存在的第一个字体族。中文由 GDI 字体链接自动补，不用另指一家。"""
+    from tkinter import font as tkfont
+    try:
+        fams = set(tkfont.families())
+    except Exception:
+        fams = set()
+
+    def pick(cands):
+        for c in cands:
+            if c in fams:
+                return c
+        return cands[-1]
+
+    _FONTS["ui"] = pick(UI_FONTS)
+    _FONTS["disp"] = pick(DISP_FONTS)
+    return _FONTS
+
+
+def ui_font(px, weight="normal"):
+    return (_FONTS["ui"] or "Segoe UI", -S(px), weight)
+
+
+def disp_font(px, weight="bold"):
+    return (_FONTS["disp"] or "Segoe UI", -S(px), weight)
+
+
+def rounded_pts(x1, y1, x2, y2, r):
+    return (x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1)
+
+
+# ------------------------------- 右键菜单 ------------------------------- #
+class PopupMenu:
+    """自绘圆角菜单：原生 tk.Menu 在 Windows 上是一块灰底 3D 边框，太旧。"""
+
+    ROW = 32
+    SEP = 9
+
+    def __init__(self, parent, items, x_root, y_root):
+        import tkinter as tk
+
+        self.root = parent
+        self.items = items
+        self._hover = -1
+        self._boxes = []
+        self.w = S(190)
+        pad = S(6)
+        self.h = pad * 2 + sum(S(self.SEP) if it["kind"] == "sep" else S(self.ROW)
+                               for it in items)
+
+        top = tk.Toplevel(parent)
+        self.top = top
+        top.overrideredirect(True)
+        top.configure(bg=C["panel"])
+        top.title("ustc-token-menu")
+        self.key = None
+        try:
+            top.attributes("-topmost", True)
+            top.attributes("-alpha", 0.98)
+            top.attributes("-transparentcolor", "#010203")
+            self.key = "#010203"
+        except Exception:
+            pass
+
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        x = max(S(2), min(int(x_root), sw - self.w - S(6)))
+        y = max(S(2), min(int(y_root), sh - self.h - S(6)))
+        top.geometry(f"{self.w}x{self.h}+{x}+{y}")
+
+        self.cv = tk.Canvas(top, width=self.w, height=self.h, highlightthickness=0, bd=0,
+                            bg=self.key or C["panel"])
+        self.cv.pack(fill="both", expand=True)
+        if self.key:
+            self.cv.create_polygon(rounded_pts(S(1), S(1), self.w - S(1), self.h - S(1), S(11)),
+                                   smooth=True, fill=C["panel"], outline=C["border"], width=1)
+
+        cy = pad
+        for idx, it in enumerate(items):
+            if it["kind"] == "sep":
+                yy = cy + S(self.SEP) // 2
+                self.cv.create_line(S(14), yy, self.w - S(14), yy, fill=C["border"], width=1)
+                cy += S(self.SEP)
+                self._boxes.append(None)
+                continue
+            x1, y1, x2, y2 = pad, cy, self.w - pad, cy + S(self.ROW)
+            self._boxes.append((y1, y2, idx))
+            hl = self.cv.create_polygon(rounded_pts(x1, y1, x2, y2, S(8)), smooth=True,
+                                        fill=C["panel"], outline="", tags=(f"hl{idx}",))
+            self.cv.itemconfigure(hl, state="hidden")
+            tx = x1 + S(13)
+            if it["kind"] == "check":
+                self.cv.create_text(x1 + S(11), (y1 + y2) // 2, text="✓" if it.get("checked") else "",
+                                    anchor="w", font=ui_font(12), fill=C["blue"])
+                tx = x1 + S(28)
+            self.cv.create_text(tx, (y1 + y2) // 2, text=it["label"], anchor="w",
+                                font=ui_font(12.5),
+                                fill=C["red"] if it.get("danger") else C["txt"])
+            if it.get("hint"):
+                self.cv.create_text(x2 - S(12), (y1 + y2) // 2, text=it["hint"], anchor="e",
+                                    font=ui_font(12), fill=C["faint"])
+            cy += S(self.ROW)
+
+        self.cv.bind("<Motion>", self._motion)
+        self.cv.bind("<Button-1>", self._click)
+        self.cv.bind("<Button-3>", lambda e: self.close())
+        top.bind("<Escape>", lambda e: self.close())
+        top.bind("<FocusOut>", lambda e: self.close())
+        top.focus_force()
+        try:
+            top.grab_set()
+        except Exception:
+            pass
+
+    def _row_at(self, y):
+        for b in self._boxes:
+            if b and b[0] <= y <= b[1]:
+                return b
+        return None
+
+    def _motion(self, e):
+        box = self._row_at(e.y)
+        idx = box[2] if box else -1
+        if idx == self._hover:
+            return
+        self._hover = idx
+        for b in self._boxes:
+            if b:
+                self.cv.itemconfigure(f"hl{b[2]}", state="normal" if b[2] == idx else "hidden",
+                                      fill=C["accentbg"])
+        self.cv.configure(cursor="hand2" if box else "")
+
+    def _click(self, e):
+        inside = 0 <= e.x <= self.w and 0 <= e.y <= self.h
+        box = self._row_at(e.y) if inside else None
+        self.close()
+        if box:
+            cmd = self.items[box[2]].get("cmd")
+            if cmd:
+                self.root.after(10, cmd)
+
+    def close(self):
+        try:
+            self.top.grab_release()
+        except Exception:
+            pass
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+
 # ------------------------------- 窗口 ------------------------------- #
 class Widget:
-    NORMAL = (286, 148)
-    MINI = (188, 58)
+    NORMAL = (300, 158)
+    MINI = (200, 62)
 
-    def __init__(self, root, cfg):
+    def __init__(self, root, cfg, autostart=True):
         import tkinter as tk
 
         self.tk = tk
@@ -203,8 +363,12 @@ class Widget:
         self.err = None
         self._busy = False
         self._items = {}
+        self._hit = {}
+        self._hover_btn = None
+        self._popup = None
         self._colors = cfg.get("colors")
-        apply_colors(self._colors)          # 看板选过的配色，开机即用
+        apply_colors(self._colors)      # 看板选过的配色，开机即用
+        init_fonts()
 
         self.W, self.H = self.size()
 
@@ -220,26 +384,21 @@ class Widget:
         root.geometry(f"{self.W}x{self.H}+{int(x) if isinstance(x, int) else 60}"
                       f"+{int(y) if isinstance(y, int) else 60}")
 
-        self.cv = tk.Canvas(root, width=self.W, height=self.H, bg=C["panel"], highlightthickness=0, bd=0)
+        self.cv = tk.Canvas(root, width=self.W, height=self.H, bg=C["panel"],
+                            highlightthickness=0, bd=0)
         self.cv.pack(fill="both", expand=True)
-        self.cv.bind("<Button-1>", self._drag_start)
+        self.cv.bind("<Button-1>", self._press)
         self.cv.bind("<B1-Motion>", self._drag_move)
         self.cv.bind("<ButtonRelease-1>", self._drag_end)
-        self.cv.bind("<Double-Button-1>", lambda e: webbrowser.open(DASHBOARD))
+        self.cv.bind("<Double-Button-1>", lambda e: open_dashboard())
         self.cv.bind("<Button-3>", self._menu)
+        self.cv.bind("<Motion>", self._motion)
+        self.cv.bind("<Leave>", self._leave)
         self.cv.bind("<Control-MouseWheel>", self._wheel_alpha)
 
-        self.menu = tk.Menu(root, tearoff=0, bg=C["panel"], fg=C["txt"],
-                            activebackground=C["accentbg"], activeforeground=C["txt"], bd=0)
-        self.menu.add_command(label="打开看板", command=lambda: webbrowser.open(DASHBOARD))
-        self.menu.add_separator()
-        self.menu.add_command(label="迷你模式", command=self.toggle_mini)
-        self.menu.add_command(label="始终置顶", command=self.toggle_topmost)
-        self.menu.add_separator()
-        self.menu.add_command(label="退出", command=self.close)
-
         self.render()          # 先画骨架（占位），避免首帧空白
-        self.tick()
+        if autostart:
+            self.tick()
 
     # ---- 窗口属性（个别平台不支持就忽略） ---- #
     def _attr(self, name, value):
@@ -259,7 +418,17 @@ class Widget:
             self.cv_bg = C["bg"]
 
     # ---- 交互 ---- #
-    def _drag_start(self, e):
+    def _in_box(self, name, x, y):
+        b = self._hit.get(name)
+        return bool(b) and b[0] <= x <= b[2] and b[1] <= y <= b[3]
+
+    def _press(self, e):
+        if self._in_box("close", e.x, e.y):
+            self.close()
+            return
+        if self._in_box("board", e.x, e.y):
+            open_dashboard()
+            return
         self._dx, self._dy = e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y()
 
     def _drag_move(self, e):
@@ -271,13 +440,40 @@ class Widget:
         self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
         save_cfg(self.cfg)
 
+    def _motion(self, e):
+        btn = "close" if self._in_box("close", e.x, e.y) else (
+            "board" if self._in_box("board", e.x, e.y) else None)
+        if btn == self._hover_btn:
+            return
+        self._hover_btn = btn
+        self.cv.configure(cursor="hand2" if btn else "")
+        self._paint_buttons()
+
+    def _leave(self, _e):
+        if self._hover_btn is None:
+            return
+        self._hover_btn = None
+        self.cv.configure(cursor="")
+        self._paint_buttons()
+
+    def _paint_buttons(self):
+        """hover 时：× 变红、看板变蓝。"""
+        hot_x = self._hover_btn == "close"
+        hot_b = self._hover_btn == "board"
+        self.cv.itemconfigure("xbtn", fill=C["red"] if hot_x else C["faint"],
+                              width=2 if hot_x else 1)
+        self.cv.itemconfigure("boardbtn", fill=C["blue"] if hot_b else C["dim"])
+
     def _menu(self, e):
-        self.menu.entryconfigure(2, label="退出迷你模式" if self.mini else "迷你模式")
-        self.menu.entryconfigure(3, label="取消置顶" if self.topmost else "始终置顶")
-        try:
-            self.menu.tk_popup(e.x_root, e.y_root)
-        finally:
-            self.menu.grab_release()
+        items = [
+            {"kind": "item", "label": "打开看板", "hint": "↗", "cmd": open_dashboard},
+            {"kind": "sep"},
+            {"kind": "check", "label": "迷你模式", "checked": self.mini, "cmd": self.toggle_mini},
+            {"kind": "check", "label": "始终置顶", "checked": self.topmost, "cmd": self.toggle_topmost},
+            {"kind": "sep"},
+            {"kind": "item", "label": "退出", "cmd": self.close, "danger": True},
+        ]
+        self._popup = PopupMenu(self.root, items, e.x_root, e.y_root)
 
     def _wheel_alpha(self, e):
         self.alpha = max(0.35, min(1.0, self.alpha + (0.05 if e.delta > 0 else -0.05)))
@@ -306,6 +502,7 @@ class Widget:
         self.root.geometry(f"{self.W}x{self.H}+{self.root.winfo_x()}+{self.root.winfo_y()}")
         self.cv.configure(width=self.W, height=self.H)
         self._items.clear()
+        self._hit.clear()
         self.cv.delete("all")
         self.render()
 
@@ -341,12 +538,10 @@ class Widget:
             pass
 
     def _repaint_bg(self):
-        """换配色时把窗口/画布底色和右键菜单也跟上。"""
+        """换配色时把窗口/画布底色跟上（圆角透明键不变）。"""
         try:
             self.root.configure(bg=C["panel"])
             self.cv.configure(bg=self.cv_bg if self.rounded else C["panel"])
-            self.menu.configure(bg=C["panel"], fg=C["txt"],
-                                activebackground=C["accentbg"], activeforeground=C["txt"])
         except Exception:
             pass
         self._items.clear()
@@ -359,8 +554,7 @@ class Widget:
         早期版本每次刷新都 create_polygon 一个新的，新底板叠在文字上面，
         于是卡片刷新一次就变成一块纯色（文字被盖住）。
         """
-        pts = (x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
-               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1)
+        pts = rounded_pts(x1, y1, x2, y2, r)
         it = self._items.get("panel")
         if it is None:
             it = self.cv.create_polygon(pts, smooth=True, **kw)
@@ -371,10 +565,13 @@ class Widget:
         self.cv.tag_lower(it)
         return it
 
-    def _text(self, name, x, y, txt, font, fill, anchor="w"):
+    def _text(self, name, x, y, txt, font, fill, anchor="w", tag=None):
         it = self._items.get(name)
+        kw = {}
+        if tag:
+            kw["tags"] = (tag,)
         if it is None:
-            it = self.cv.create_text(x, y, text=txt, font=font, fill=fill, anchor=anchor)
+            it = self.cv.create_text(x, y, text=txt, font=font, fill=fill, anchor=anchor, **kw)
             self._items[name] = it
         else:
             self.cv.coords(it, x, y)
@@ -391,77 +588,120 @@ class Widget:
             self.cv.itemconfigure(it, fill=fill)
         return it
 
+    def _pill(self, name, x1, y1, x2, y2, r, fill):
+        it = self._items.get(name)
+        h = max(1, y2 - y1)
+        pts = rounded_pts(x1, y1, x2, y2, min(r, h / 2.0))
+        if it is None:
+            it = self.cv.create_polygon(pts, smooth=True, fill=fill, outline="")
+            self._items[name] = it
+        else:
+            self.cv.coords(it, *pts)
+            self.cv.itemconfigure(it, fill=fill)
+        return it
+
     def _bar(self, name, x1, y, w, pct, color):
-        h = S(6)
-        self._rect(name + "t", x1, y, x1 + w, y + h, C["track"])
+        h = S(7)
+        self._pill(name + "t", x1, y, x1 + w, y + h, h / 2.0, C["track"])
         ww = max(0.0, min(100.0, pct)) / 100.0 * w
         if ww >= 1:
-            self._rect(name + "f", x1, y, x1 + ww, y + h, color)
+            self._pill(name + "f", x1, y, x1 + max(h, ww), y + h, h / 2.0, color)
         else:
-            self._rect(name + "f", x1, y, x1 + 1, y + h, C["bg"])
+            self._pill(name + "f", x1, y, x1, y + h, 0.5, C["panel"])
+
+    def _close_x(self, cx, cy, k):
+        """关闭按钮：两条线画的 ×，不依赖字体里有没有 ✕。"""
+        if "close1" not in self._items:
+            self._items["close1"] = self.cv.create_line(cx - k, cy - k, cx + k, cy + k,
+                                                        fill=C["faint"], width=1, tags=("xbtn",))
+            self._items["close2"] = self.cv.create_line(cx - k, cy + k, cx + k, cy - k,
+                                                        fill=C["faint"], width=1, tags=("xbtn",))
+        else:
+            self.cv.coords(self._items["close1"], cx - k, cy - k, cx + k, cy + k)
+            self.cv.coords(self._items["close2"], cx - k, cy + k, cx + k, cy - k)
 
     def render(self, data=None):
         if data is None:
             data = self.data
         v = data or {}
-        tk = self.tk
         W, H = self.W, self.H
-        f_big = ("Cascadia Mono", -S(23), "bold")
-        f_unit = ("Microsoft YaHei UI", -S(11))
-        f_num = ("Microsoft YaHei UI", -S(12))
-        f_lbl = ("Microsoft YaHei UI", -S(11))
-        f_lbl2 = ("Microsoft YaHei UI", -S(12))
-        pad = S(13)
+        mini = self.mini
+        pad = S(14)
+        f_hero = disp_font(24 if mini else 30, "bold")
+        f_unit = ui_font(12)
+        f_lbl = ui_font(12)
+        f_foot = ui_font(11)
+        f_btn = ui_font(11.5)
+        hero_y = S(42) if mini else S(43)
+        unit_y = hero_y + S(3)
 
         if self.rounded:
             self.cv.configure(bg=self.cv_bg)
-            r = S(11)
             # 内缩 1px：描边完整落在画布内，外圈 1px 是透明色键（干净的圆角边）
-            self._rr(S(1), S(1), W - S(1), H - S(1), r,
+            self._rr(S(1), S(1), W - S(1), H - S(1), S(12),
                      fill=C["panel"], outline=C["border"], width=1)
         else:
             self.cv.configure(bg=C["panel"])
 
-        # 第一行：速度（左）· 5m 用量（右）
+        # ---- 顶栏：看板入口 + 关闭 ----
+        cy = S(13)
+        board = self._text("board", W - S(36), cy, "看板 ↗", f_btn, C["dim"], anchor="e",
+                           tag="boardbtn")
+        bb = self.cv.bbox(board)
+        self._hit["board"] = (bb[0] - S(6), bb[1] - S(4), bb[2] + S(5), bb[3] + S(4))
+        cx = W - S(15)
+        self._close_x(cx, cy, S(4))
+        self._hit["close"] = (cx - S(12), cy - S(12), cx + S(12), cy + S(12))
+
+        # ---- 第一行：速度 ----
         err = v.get("err") or self.err
         dot = C["red"] if err else C["green"]
-        self._rect("dot", pad, S(21), pad + S(3), S(30), dot)
+        self._rect("dot", pad, hero_y - S(8), pad + S(4), hero_y + S(3), dot)
         tps_txt = fmt_tps(v.get("tps")) if v else "—"
-        tw = self._text("tps", pad + S(10), S(27), tps_txt, f_big, C["txt"], anchor="w")
-        ux = self.cv.bbox(tw)[2] + 4
-        self._text("unit", ux, S(30), "tok/s", f_unit, C["dim"])
+        tw = self._text("tps", pad + S(10), hero_y, tps_txt, f_hero, C["txt"], anchor="w")
+        ux = self.cv.bbox(tw)[2] + S(4)
+        uw = self._text("unit", ux, unit_y, "tok/s", f_unit, C["dim"])
         idle = v.get("idle") or ""
-        self._text("m5", W - pad, S(27), f"5m {v.get('m5', '—')}", f_num, C["dim"], anchor="e")
-        if idle:
-            self._text("idle", W - pad, S(9), idle, f_lbl, C["faint"], anchor="e")
+        self._text("idle", self.cv.bbox(uw)[2] + S(6), unit_y, ("· " + idle) if idle else "",
+                   f_btn, C["faint"])
+        self._text("m5", W - pad, hero_y, f"5m {v.get('m5', '—')}", f_lbl, C["dim"], anchor="e")
 
         if self.mini:
+            self._paint_buttons()
             return
 
-        # 第二行：1h 用量 · 首包
-        self._text("h1", pad, S(50), f"1h {v.get('h1', '—')}  ·  {v.get('h1req', 0)} 次", f_lbl2, C["dim"])
-        self._text("ttft", W - pad, S(50), v.get("ttft", "首包 —"), f_lbl2, C["dim"], anchor="e")
+        # ---- 第二行：1h 用量 · 首包 ----
+        self._text("h1", pad, S(74), f"1h {v.get('h1', '—')}  ·  {v.get('h1req', 0)} 次",
+                   f_lbl, C["dim"])
+        self._text("ttft", W - pad, S(74), v.get("ttft", "首包 —"), f_lbl, C["dim"], anchor="e")
 
-        # 限额两条
-        barw = W - pad - S(22) - S(66)
+        # ---- 限额两条 ----
+        barw = W - pad - S(26) - S(58)
         for idx, key in ((0, "b3"), (1, "b12")):
             b = v.get(key)
             txt, pct = budget_text(b)
-            y = S(69) + idx * S(22)
-            self._text(key + "l", pad, y + S(3), "3h" if idx == 0 else "12h", f_lbl, C["faint"])
+            y = S(96) + idx * S(23)
+            self._text(key + "l", pad, y + S(3), "3h" if idx == 0 else "12h", f_btn, C["faint"])
             color = C["red"] if pct > 85 else C["amber"] if pct > 60 else C["blue"]
-            self._bar(key, pad + S(22), y, barw, pct, color)
-            self._text(key + "v", W - pad, y + S(3), txt, f_lbl, C["dim"], anchor="e")
+            self._bar(key, pad + S(26), y, barw, pct, color)
+            self._text(key + "v", W - pad, y + S(3), txt, f_btn, C["dim"], anchor="e")
 
-        # 底线：时间 / 全天 / 状态
+        # ---- 底线：时间 / 全天 ----
         if err:
             msg = str(err)
             msg = msg if len(msg) <= 26 else msg[:25] + "…"
-            self._text("foot", pad, H - S(15), "⚠ " + msg, f_lbl, C["red"])
+            self._text("foot", pad, H - S(13), "⚠ " + msg, f_foot, C["red"])
+            self._text("day", W - pad, H - S(13), "", f_foot, C["faint"], anchor="e")
         else:
-            self._text("foot", pad, H - S(15), f"{v.get('clock', '--:--:--')} · {v.get('ago', '')}",
-                       f_lbl, C["faint"])
-            self._text("day", W - pad, H - S(15), v.get("dayline", "全天 —"), f_lbl, C["faint"], anchor="e")
+            self._text("foot", pad, H - S(13),
+                       f"{v.get('clock', '--:--:--')} · {v.get('ago', '')}", f_foot, C["faint"])
+            self._text("day", W - pad, H - S(13), v.get("dayline", "全天 —"), f_foot, C["faint"],
+                       anchor="e")
+        self._paint_buttons()
+
+
+def open_dashboard():
+    webbrowser.open(DASHBOARD)
 
 
 # ------------------------------- 自检 ------------------------------- #
@@ -473,7 +713,7 @@ def selftest():
     root = tk.Tk()
     root.withdraw()
     _init_scale(root)
-    wdg = Widget(root, {"x": 40, "y": 40})
+    wdg = Widget(root, {"x": 40, "y": 40}, autostart=False)
 
     fix_full = view({
         "poll": {"last_ok_ago_s": 3, "last_err": None},
@@ -552,6 +792,22 @@ def selftest():
     apply_colors(None)                              # 复位默认浅色
     ok.append(("复位为白底", C["panel"] == "#ffffff", C["panel"]))
 
+    # 按钮命中区：× 在右上角、看板在它左边、其余地方点下去是拖动
+    W_, H_ = wdg.W, wdg.H
+    ok.append(("× 可点", wdg._in_box("close", W_ - S(15), S(13)), wdg._hit.get("close")))
+    ok.append(("看板可点", wdg._in_box("board", W_ - S(46), S(13)), wdg._hit.get("board")))
+    ok.append(("空白处不是按钮", not wdg._in_box("close", S(40), H_ - S(20)), ""))
+
+    # 自绘菜单：行高、宽度、分隔不占行
+    pm = PopupMenu(root, [
+        {"kind": "item", "label": "打开看板", "hint": "↗", "cmd": None},
+        {"kind": "sep"},
+        {"kind": "check", "label": "迷你模式", "checked": True, "cmd": None},
+        {"kind": "item", "label": "退出", "danger": True, "cmd": None},
+    ], S(20), S(20))
+    ok.append(("菜单可建", pm.h > S(40) and len(pm._boxes) == 4, f"{pm.w}x{pm.h}"))
+    pm.close()
+
     root.destroy()
 
     fails = [n for n, good, _ in ok if not good]
@@ -561,6 +817,27 @@ def selftest():
     return 0 if not fails else 1
 
 
+def demo_menu():
+    """把浮窗和右键菜单都摆出来（截图核对用）。"""
+    import tkinter as tk
+
+    _dpi_aware()
+    root = tk.Tk()
+    _init_scale(root)
+    root.withdraw()
+    wdg = Widget(root, {"x": 80, "y": 80, "theme": "paper"})
+    wdg.root.deiconify()
+    wdg.root.geometry(f"+{S(80)}+{S(80)}")
+
+    def show():
+        wdg._menu(type("E", (), {"x_root": S(80) + S(306), "y_root": S(80) + S(52)})())
+        root.after(9000, root.destroy)
+
+    root.after(600, show)
+    root.mainloop()
+    return 0
+
+
 def dump():
     import tkinter as tk
 
@@ -568,7 +845,7 @@ def dump():
     root = tk.Tk()
     root.withdraw()
     _init_scale(root)
-    wdg = Widget(root, {"x": 40, "y": 40})
+    wdg = Widget(root, {"x": 40, "y": 40}, autostart=False)
     try:
         data = view(fetch(API_URL))
     except Exception as e:
@@ -624,6 +901,8 @@ def main():
         return selftest()
     if "--dump" in args:
         return dump()
+    if "--demo-menu" in args:
+        return demo_menu()
 
     import tkinter as tk
 

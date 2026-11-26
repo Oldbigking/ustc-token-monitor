@@ -18,6 +18,37 @@ window.__ModuleLoader__.load({
 			return res.json();
 		};
 
+		/* 唤起桌面浮窗：先走宿主代理（同源、不用管 CORS），失败再直连监测器 */
+		const postJson = async (url) => {
+			const res = await fetch(url, { method: "POST", cache: "no-store" });
+			if (!res.ok) throw new Error("HTTP " + res.status);
+			return res.json();
+		};
+		const openDashboard = () => window.open(DASHBOARD, "_blank", "noopener");
+		const openWidget = async () => {
+			const urls = [
+				"/ustc-token/widget/open",
+				DIRECT.replace(/\/api\/summary$/, "/api/widget/open"),
+			];
+			for (const url of urls) {
+				try {
+					const r = await postJson(url);
+					if (r && r.ok) return true;
+				} catch (error) {
+					/* 试下一个入口 */
+				}
+			}
+			return false;
+		};
+		/* 点击 = 唤起浮窗；浮窗拉不起来就退回看板。Shift/Alt/Ctrl/中键/右键 = 直接看板 */
+		const onBadgeClick = async (event) => {
+			if (event && (event.shiftKey || event.altKey || event.ctrlKey || event.metaKey)) {
+				openDashboard();
+				return;
+			}
+			if (!(await openWidget())) openDashboard();
+		};
+
 		const fmt = (n) => {
 			if (n === null || n === undefined) return "–";
 			if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
@@ -99,6 +130,7 @@ window.__ModuleLoader__.load({
 
 			const title = ok
 				? [
+						"点击唤起桌面浮窗（Shift/右键 打开看板）",
 						"最近 5 分钟窗口 " + (m5.start_local || "–") + "–" + (m5.end_local || "–") +
 							"（末次调用 " + (m5.last_call_local || "–") + "）",
 						"平均 " + (tps ? tps.toFixed(1) : "–") + " tok/s（加权，" + (m5.req || 0) + " 次）",
@@ -108,11 +140,10 @@ window.__ModuleLoader__.load({
 						"首 token " + (data.ttft_ms || "–") + " ms",
 						"今日 " + fmt(data.day && data.day.total) + " token / 费用 " + ((data.day && data.day.spend) || 0).toFixed(2),
 						budget ? "3h 限额 " + (budget.used || 0).toFixed(2) + " / " + (budget.max || 0) : "",
-						"点击打开看板",
 				  ]
 						.filter(Boolean)
 						.join("\n")
-				: "监测服务未运行：点击打开看板，或运行 start.bat";
+				: "监测服务未运行：点击尝试唤起浮窗，或运行 start.bat";
 
 			return React.createElement(
 				"button",
@@ -120,7 +151,14 @@ window.__ModuleLoader__.load({
 					type: "button",
 					style: pill,
 					title,
-					onClick: () => window.open(DASHBOARD, "_blank", "noopener"),
+					onClick: onBadgeClick,
+					onContextMenu: (event) => {
+						event.preventDefault();
+						openDashboard();
+					},
+					onAuxClick: (event) => {
+						if (event.button === 1) openDashboard();   // 中键
+					},
 					onMouseEnter: (e) => (e.currentTarget.style.background = "var(--dsh-surface-hover, rgba(127,127,127,.10))"),
 					onMouseLeave: (e) => (e.currentTarget.style.background = "transparent"),
 				},

@@ -22,6 +22,7 @@ import os
 import re
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -714,6 +715,46 @@ def widget_cfg_write(d):
         return False
 
 
+WIDGET_PATH = os.path.join(HERE, "widget.py")
+
+
+def widget_open():
+    """唤起悬浮小窗：已经在跑就把它拎到最前，没跑就拉一个新进程。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            hwnd = u.FindWindowW(None, "USTC Token")
+            if hwnd:
+                u.ShowWindow(hwnd, 5)              # SW_SHOW
+                u.SetForegroundWindow(hwnd)
+                return {"ok": True, "action": "raised"}
+        except Exception:
+            pass
+    if not os.path.exists(WIDGET_PATH):
+        return {"ok": False, "error": f"找不到 {WIDGET_PATH}"}
+    now = time.time()
+    with LOCK:
+        last = STATE.get("widget_spawn_at") or 0
+        if now - last < 3:                          # 连点防抖：3 秒内只拉一次
+            return {"ok": True, "action": "starting"}
+        STATE["widget_spawn_at"] = now
+    exe = sys.executable
+    if sys.platform == "win32":
+        cand = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if os.path.exists(cand):
+            exe = cand
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        subprocess.Popen([exe, WIDGET_PATH], cwd=HERE, creationflags=flags,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "action": "started"}
+
+
 def widget_payload():
     cfg = widget_cfg_read()
     key = cfg.get("theme")
@@ -829,6 +870,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/api/widget/open":
+            self._send(200, json.dumps(widget_open(), ensure_ascii=False),
+                       "application/json; charset=utf-8")
+            return
         if parsed.path != "/api/widget":
             self._send(404, "not found", "text/plain")
             return
