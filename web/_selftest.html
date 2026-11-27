@@ -281,22 +281,25 @@ function run() {
       s2: { color: '--blue', fmtV: v => String(Math.round(v)), unit: 'tok/s', connect, data: src2 },
     });
     const polys = [...el.querySelectorAll('polyline')].map(p => p.getAttribute('points').split(' ').length);
-    return polys;
+    const dashes = [...el.querySelectorAll('line')].filter(l => l.getAttribute('stroke-dasharray') === '4 3');
+    return { polys, dashes: dashes.length };
   };
   /* connect：同一时段（无断点）内跨过没采样的格子连成一条；断点格子处必须断开 */
+  /* 缺记录的格子：实线断成两段，中间一段虚线、不填充；折轴断点处直接断开（无虚线） */
   const connOn = lineCount(true, false);
   const connOff = lineCount(false, false);
   const connBrk = lineCount(true, true);
-  const connOk = connOn.length === 1 && connOn[0] === 4
-    && connOff.length === 2
-    && connBrk.length === 2 && connBrk[0] === 2 && connBrk[1] === 2;
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const connOk = eq(connOn.polys, [2, 2]) && connOn.dashes === 1
+    && eq(connOff.polys, [2, 2]) && connOff.dashes === 0
+    && eq(connBrk.polys, [2, 2]) && connBrk.dashes === 0;
   checked++;
   if (!connOk) {
     fails.push('折线跨空档');
-    log.push('FAIL 折线跨空档 同段连续=' + JSON.stringify(connOn) +
-      ' 默认=' + JSON.stringify(connOff) + ' 断点断开=' + JSON.stringify(connBrk));
+    log.push('FAIL 折线跨空档 缺记录=' + JSON.stringify(connOn) +
+      ' 默认=' + JSON.stringify(connOff) + ' 断点=' + JSON.stringify(connBrk));
   } else {
-    log.push('ok   折线跨空档（同段 1 条 4 点 / 默认 2 条 / 断点两侧各 2 点）');
+    log.push('ok   折线跨空档（缺记录 2 段+1 虚线 / 默认 2 段无虚线 / 断点 2 段无虚线）');
   }
 
   /* 纵轴贴合度：数据最大值 / 轴上限 应 >= 0.78（旧算法 118 → 200 只有 0.59） */
