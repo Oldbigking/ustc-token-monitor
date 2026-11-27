@@ -263,6 +263,19 @@ function run() {
   if (!okTip2) fails.push('联动提示');
   if (!okAlign) fails.push('横轴对齐');
 
+  /* 纵轴贴合度：数据最大值 / 轴上限 应 >= 0.78（旧算法 118 → 200 只有 0.59） */
+  const axCases = [[117.7, 125], [4004, 5000], [53.7, 66], [2170, 2600], [1.2e6, 1.4e6]];
+  const axBad = [];
+  axCases.forEach(([v, cap]) => {
+    const m = w.niceMax(v);
+    if (!(m >= v)) axBad.push(v + '→' + m + ' 轴比数据小');
+    else if (m > cap) axBad.push(v + '→' + m + ' 太松（上限 ' + cap + '）');
+    else if (v / m < 0.78) axBad.push(v + '→' + m + ' 只占 ' + (v / m * 100).toFixed(0) + '%');
+  });
+  checked++;
+  if (axBad.length) { fails.push('纵轴贴合'); log.push('FAIL 纵轴贴合 ' + axBad.join(' / ')); }
+  else log.push('ok   纵轴贴合（117.7→' + w.niceMax(117.7) + '，4004→' + w.niceMax(4004) + '）');
+
   document.getElementById('out').textContent =
     log.join('\n') + '\n\n共 ' + checked + ' 个用例，失败 ' + fails.length + ' 个' +
     (fails.length ? '：' + fails.join(' / ') : '');

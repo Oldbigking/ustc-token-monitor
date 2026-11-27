@@ -209,7 +209,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
 
   <section class="one">
     <div class="card">
-      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span><select id="gapSel" class="gapsel" title="空档折叠阈值：超过这个时长的空档会压成一个断点"><option value="10">空档 10m</option><option value="30">空档 30m</option></select></h2>
+      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span><select id="bucketSel" class="gapsel" title="图表细度：每格多宽。窗口固定 60 格，所以 30s≈近 30 分钟、1h≈近 60 小时"><option value="30">30 秒</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select><select id="gapSel" class="gapsel" title="空档折叠阈值：超过这个时长的空档会压成一个断点"><option value="10">空档 10m</option><option value="30">空档 30m</option></select></h2>
       <svg class="chart" id="chartMinute"></svg>
     </div>
   </section>
@@ -294,19 +294,29 @@ const palette = () => ({
 });
 
 const fx = {
-  tokY: v => v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? Math.round(v / 1e3) + 'k' : String(Math.round(v)),
+  /* 刻度可能出现 2.5k 这种半步长，整数就不带小数，有零头才带一位 */
+  tokY: v => {
+    if (Math.abs(v) >= 1e6) { const m = v / 1e6; return (m % 1 ? m.toFixed(1) : m.toFixed(0)) + 'M'; }
+    if (Math.abs(v) >= 1e3) { const k = v / 1e3; return (k % 1 ? k.toFixed(1) : k.toFixed(0)) + 'k'; }
+    return String(Math.round(v));
+  },
   tpsY: v => (v % 1 ? v.toFixed(1) : v.toFixed(0)),
   msY: v => v >= 1000 ? (v / 1000).toFixed(1) + 's' : Math.round(v) + 'ms',
   /* 纵轴统一用秒：避免一根轴上出现 0ms 与 25.0s 混排 */
   secY: v => (v / 1000).toFixed(v % 1000 ? 1 : 0) + 's',
 };
 
+/* 纵轴上限：把"数据最大值 / 4 格"当成刻度步长，再取最近的整数步长。
+   旧的 1/2/5 三级阶梯把 118 tok/s 抬到 200，柱子只占 59% 高度；
+   这里的阶梯更密（多了 1.2/1.5/3/4/6/8），上限最多比数据高 20%，通常 10% 以内。 */
 function niceMax(v) {
   if (!(v > 0)) return 1;
-  const e = Math.pow(10, Math.floor(Math.log10(v)));
-  const m = v / e;
-  const step = m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10;
-  return step * e;
+  const raw = v / 4;
+  const e = Math.pow(10, Math.floor(Math.log10(raw)));
+  const m = raw / e;
+  const step = m <= 1 ? 1 : m <= 1.2 ? 1.2 : m <= 1.5 ? 1.5 : m <= 2 ? 2 : m <= 2.5 ? 2.5
+    : m <= 3 ? 3 : m <= 4 ? 4 : m <= 5 ? 5 : m <= 6 ? 6 : m <= 8 ? 8 : 10;
+  return Math.round(step * e * 4 * 1e6) / 1e6;   /* 抹掉 1.2*1000*4 这类浮点尾巴 */
 }
 
 /* 近似文字宽度：中文字符按满宽、其余按 0.58em，用于标签避让 */
@@ -701,6 +711,40 @@ function initGap() {
   return v;
 }
 let GAP_MIN = 30;
+const BUCKET_CHOICES = [30, 60, 300, 900, 1800, 3600];
+let BUCKET_S = 60;
+
+/* 细度与窗口的人话说法 */
+function bucketLabel(s) {
+  return s < 60 ? s + ' 秒' : s < 3600 ? (s / 60) + ' 分钟' : (s / 3600) + ' 小时';
+}
+function spanLabel(spanS) {
+  const m = Math.round((spanS || 3600) / 60);
+  if (m < 90) return '近 ' + m + ' 分钟';
+  const h = m / 60;
+  return '近 ' + (h < 10 ? h.toFixed(1) : Math.round(h)) + ' 小时';
+}
+
+function initBucket() {
+  const fromUrl = parseInt(QS.get('bucket'), 10);
+  const fromLs = parseInt(localStorage.getItem('bucketS'), 10);
+  const v = BUCKET_CHOICES.includes(fromUrl) ? fromUrl
+    : BUCKET_CHOICES.includes(fromLs) ? fromLs : 60;
+  const sel = $('bucketSel');
+  sel.innerHTML = BUCKET_CHOICES.map(s =>
+    '<option value="' + s + '">' + bucketLabel(s) + '</option>').join('');
+  sel.value = String(v);
+  sel.addEventListener('change', () => {
+    const next = parseInt(sel.value, 10) || 60;
+    BUCKET_S = next;                      // 立刻生效，tick() 才会带新细度请求
+    localStorage.setItem('bucketS', String(next));
+    const q = new URLSearchParams(location.search);
+    q.set('bucket', String(next));
+    history.replaceState(null, '', '?' + q.toString());
+    tick();
+  });
+  return v;
+}
 let LAST = null;
 
 function syncSources(d) {
@@ -736,6 +780,7 @@ async function tick() {
     const qp = new URLSearchParams();
     if (CURRENT_SOURCE) qp.set('source', CURRENT_SOURCE);
     qp.set('gap', String(GAP_MIN));
+    qp.set('bucket', String(BUCKET_S));
     const q = '?' + qp.toString();
     d = await (await fetch('/api/summary' + q, { cache: 'no-store' })).json();
   } catch (err) {
@@ -796,11 +841,18 @@ async function tick() {
   const hasBrk = win.some(m => m.brk);
   const gsel = $('gapSel');
   if (gsel.value !== String(GAP_MIN)) gsel.value = String(GAP_MIN);
+  const gs = $('gapSel');
+  if (gs.value !== String(GAP_MIN)) gs.value = String(GAP_MIN);
+  const bsEl = $('bucketSel');
+  if (bsEl.value !== String(BUCKET_S)) bsEl.value = String(BUCKET_S);
+  const gapTxt = (d.gap_s || 0) >= 3600
+    ? ((d.gap_s / 3600).toFixed(d.gap_s % 3600 ? 1 : 0) + 'h')
+    : Math.round((d.gap_s || 0) / 60) + 'm';
   $('minuteHint').textContent = !win.length
     ? '还没有调用记录'
-    : hasBrk
-      ? `空档已压缩（>${GAP_MIN >= 60 ? GAP_MIN / 60 + 'h' : GAP_MIN + 'm'} 折轴）· 柱：输出 token（左轴）· 折线：tok/s（右轴）`
-      : '近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）';
+    : `细度 ${bucketLabel(d.bucket_s || BUCKET_S)} · ${spanLabel(d.span_s)}`
+      + (hasBrk ? ` · 空档 >${gapTxt} 折轴` : '')
+      + ' · 柱：输出 token（左轴）· 折线：tok/s（右轴）';
   chart('chartMinute', {
     kind: 'bar', color: '--green', fmtV: fx.tokY, unit: '输出 token',
     data: win.map(m => m.brk
@@ -928,6 +980,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 
 applyTheme(mode, false);
 GAP_MIN = initGap();
+BUCKET_S = initBucket();
 wkLoad();
 tick();
 setInterval(tick, 5000);

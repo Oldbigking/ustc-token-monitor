@@ -701,6 +701,16 @@ class Widget:
 
 
 def open_dashboard():
+    """让监测器去开看板：已经有看板窗口就抬到最前，不会每次都新开一个。
+    监测器没跑（或者旧版本没有这个接口）才退回自己开浏览器。"""
+    url = DASHBOARD + "api/dashboard/open"
+    try:
+        req = urllib.request.Request(url, data=b"", method="POST")
+        with _OPENER.open(req, timeout=3) as r:
+            r.read()
+        return
+    except Exception:
+        pass
     webbrowser.open(DASHBOARD)
 
 

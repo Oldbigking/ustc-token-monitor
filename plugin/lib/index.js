@@ -15,6 +15,7 @@ const MONITOR_PORT = Number.parseInt(process.env.USTC_MONITOR_PORT || "8790", 10
 const MONITOR_BASE = `http://127.0.0.1:${MONITOR_PORT}`;
 const UPSTREAM = `${MONITOR_BASE}/api/summary`;
 const UPSTREAM_OPEN = `${MONITOR_BASE}/api/widget/open`;
+const UPSTREAM_DASH = `${MONITOR_BASE}/api/dashboard/open`;
 
 export const inject = ["webServer"];
 
@@ -43,14 +44,19 @@ export function apply(ctx) {
 				path: "/ustc-token",
 				handler: async (req, res) => {
 					const url = new URL(req.url ?? "/", "http://127.0.0.1");
-					if (url.pathname === "/ustc-token/widget/open") {
+					/* 两个 POST 转发：唤起浮窗 / 打开看板（看板已有窗口时会抬到最前） */
+					const posts = {
+						"/ustc-token/widget/open": UPSTREAM_OPEN,
+						"/ustc-token/dashboard/open": UPSTREAM_DASH,
+					};
+					if (posts[url.pathname]) {
 						if (req.method !== "POST") {
 							res.writeHead(405, { "Content-Type": "text/plain" });
 							res.end("method not allowed");
 							return;
 						}
 						try {
-							const upstream = await fetch(UPSTREAM_OPEN, { method: "POST", cache: "no-store" });
+							const upstream = await fetch(posts[url.pathname], { method: "POST", cache: "no-store" });
 							const body = await upstream.text();
 							res.writeHead(upstream.status, {
 								"Content-Type": "application/json; charset=utf-8",

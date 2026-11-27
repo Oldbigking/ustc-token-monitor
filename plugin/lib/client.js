@@ -24,7 +24,22 @@ window.__ModuleLoader__.load({
 			if (!res.ok) throw new Error("HTTP " + res.status);
 			return res.json();
 		};
-		const openDashboard = () => window.open(DASHBOARD, "_blank", "noopener");
+		const openDashboard = async () => {
+			/* 让监测器去开：已经有看板窗口就抬到最前，不会每次点多一个标签页 */
+			const urls = [
+				"/ustc-token/dashboard/open",
+				DIRECT.replace(/\/api\/summary$/, "/api/dashboard/open"),
+			];
+			for (const url of urls) {
+				try {
+					const r = await postJson(url);
+					if (r && r.ok) return;
+				} catch (error) {
+					/* 试下一个入口 */
+				}
+			}
+			window.open(DASHBOARD, "_blank", "noopener");
+		};
 		const openWidget = async () => {
 			const urls = [
 				"/ustc-token/widget/open",

@@ -29,6 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -413,7 +414,21 @@ def build_sources(allrows):
     return sorted(out, key=lambda x: -x["tokens"])
 
 
-def summarize(window_hours=1.0, recent=12, source=None, gap_min=30):
+# 折轴图的细度：格子宽度（秒）。窗口固定 60 格，所以 30s ≈ 近 30 分钟、1h ≈ 近 60 小时
+BUCKET_CHOICES = (30, 60, 300, 900, 1800, 3600)
+BUCKET_DEFAULT = 60
+
+
+def bucket_norm(v):
+    """把用户传的细度收拢到最接近的合法值。"""
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return BUCKET_DEFAULT
+    return min(BUCKET_CHOICES, key=lambda x: abs(x - v))
+
+
+def summarize(window_hours=1.0, recent=12, source=None, gap_min=30, bucket_s=BUCKET_DEFAULT):
     now = time.time()
     day_start = local(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     w_start = now - window_hours * 3600
@@ -493,18 +508,32 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30):
             b["t_local"] = local(b["t"]).strftime("%H:%M")
         return out
 
+    bucket_s = bucket_norm(bucket_s)
     minute_anchor = (now // 60) * 60 - 59 * 60
     minutes = bucket([r for r in rows if r["t0"] >= minute_anchor], 60, minute_anchor, 60)
 
     # 折轴（时间轴压缩）：单段空档超过阈值（默认 30 分钟）就压成一个断点格子，其余照常；
     # 这样闲置几小时后仍能看到"上次活动长什么样 —— 空了多久 —— 现在"。
     minutes_cut = []
+    gap_s = gap_min * 60
     last_any = max((r["t0"] for r in allrows), default=None)
     if last_any is not None:
         lo = min(now - 48 * 3600, last_any - 1800)          # 至少覆盖上一次活动
-        a0 = (int(lo) // 60 + 1) * 60
-        cnt = max(1, int((now - a0) // 60) + 1)
-        raw = bucket([r for r in allrows if r["t0"] >= a0], 60, a0, cnt)
+        lo = max(lo, now - 4000 * bucket_s)                  # 30s 细度下别真铺 48 小时的格子
+        a0 = (int(lo) // bucket_s + 1) * bucket_s
+        cnt = max(1, int((now - a0) // bucket_s) + 1)
+        raw = bucket([r for r in allrows if r["t0"] >= a0], bucket_s, a0, cnt)
+
+        # 时间标签：30s 带秒、跨天窗口带日期，其余只到分
+        span_s = cnt * bucket_s
+        for b in raw:
+            d = local(b["t"])
+            if bucket_s < 60:
+                b["t_local"] = d.strftime("%H:%M:%S")
+            elif span_s > 30 * 3600:
+                b["t_local"] = d.strftime("%m-%d %H:%M")
+            else:
+                b["t_local"] = d.strftime("%H:%M")
 
         def _gap_label(sec):
             m = max(1, int(round(sec / 60.0)))
@@ -515,7 +544,10 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30):
             d, rem = divmod(m, 1440)
             return f"{d}d" + (f"{rem // 60}h" if rem >= 60 else "")
 
-        runs = {}                                           # 空档起点 -> 空档长度（仅 >30 分钟）
+        # 阈值按格数算：细度 1h、阈值 30m 时其实一格（1h）就算空档
+        gap_cells = max(1, int(round(gap_min * 60.0 / bucket_s)))
+        gap_s = gap_cells * bucket_s
+        runs = {}                                           # 空档起点 -> 空档格数
         i = 0
         while i < len(raw):
             if raw[i]["req"]:
@@ -524,16 +556,16 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30):
             j = i
             while j < len(raw) and not raw[j]["req"]:
                 j += 1
-            if j - i > gap_min:
+            if j - i > gap_cells:
                 runs[i] = j - i
             i = j
         i = 0
         while i < len(raw):
             ln = runs.get(i)
             if ln:
-                to_ts = a0 + (i + ln) * 60 if i + ln < len(raw) else now
+                to_ts = a0 + (i + ln) * bucket_s if i + ln < len(raw) else now
                 minutes_cut.append({
-                    "brk": True, "gap_s": ln * 60, "gap_label": _gap_label(ln * 60),
+                    "brk": True, "gap_s": ln * bucket_s, "gap_label": _gap_label(ln * bucket_s),
                     "from_local": local(a0 + i * 60).strftime("%m-%d %H:%M"),
                     "to_local": local(to_ts).strftime("%m-%d %H:%M"),
                 })
@@ -641,6 +673,11 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30):
         "minutes": minutes,
         "minutes_cut": minutes_cut,
         "gap_min": gap_min,
+        "gap_s": gap_s,
+        "bucket_s": bucket_s,
+        "points": 60,
+        "span_s": 60 * bucket_s,
+        "buckets": list(BUCKET_CHOICES),
         "hours": hours,
         "history": history,
         "alltime": alltime,
@@ -755,6 +792,96 @@ def widget_open():
     return {"ok": True, "action": "started"}
 
 
+# --------------------------------------------------------------------------- #
+# 打开看板：同一份看板只留一个窗口
+# --------------------------------------------------------------------------- #
+DASHBOARD_TITLE = "USTC Token 监测"
+BROWSER_IMAGES = {"msedge.exe", "chrome.exe", "brave.exe", "vivaldi.exe", "opera.exe",
+                  "firefox.exe", "arc.exe"}
+
+
+def _enum_windows():
+    """[(hwnd, 标题, pid, 窗口类, 是否可见)]；只调 user32，出错就返回空表。"""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    out = []
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _lparam):
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        cls = ctypes.create_unicode_buffer(256)
+        u.GetClassNameW(hwnd, cls, 256)
+        title = ""
+        n = u.GetWindowTextLengthW(hwnd)
+        if n:
+            buf = ctypes.create_unicode_buffer(n + 1)
+            u.GetWindowTextW(hwnd, buf, n + 1)
+            title = buf.value
+        out.append((hwnd, title, pid.value, cls.value, bool(u.IsWindowVisible(hwnd))))
+        return True
+
+    u.EnumWindows(proc(cb), 0)
+    return out
+
+
+def _proc_image(pid):
+    """进程 exe 名（小写）；拿不到返回空串。"""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value).lower()
+    except Exception:
+        pass
+    finally:
+        k.CloseHandle(h)
+    return ""
+
+
+def _raise_window(hwnd):
+    import ctypes
+    u = ctypes.windll.user32
+    u.ShowWindow(hwnd, 9)                            # SW_RESTORE（最小化也能救回来）
+    ok = bool(u.SetForegroundWindow(hwnd))
+    u.BringWindowToTop(hwnd)
+    return ok
+
+
+def dashboard_open(port=8790):
+    """已经有看板窗口就抬到最前；只有在找不到时才新开标签页。"""
+    url = f"http://127.0.0.1:{port}/"
+    if sys.platform == "win32":
+        try:
+            wins = _enum_windows()
+            for hwnd, title, _pid, _cls, vis in wins:
+                if vis and DASHBOARD_TITLE in title:
+                    _raise_window(hwnd)
+                    return {"ok": True, "action": "focused", "window": title}
+            # 看板标签在后台时窗口标题不是它，就把浏览器主窗口抬上来（最近 45 秒内见过看板）
+            if time.time() - (STATE.get("dash_seen") or 0) < 45:
+                for hwnd, title, pid, cls, vis in wins:
+                    if not vis or not title or cls != "Chrome_WidgetWin_1":
+                        continue
+                    if _proc_image(pid) in BROWSER_IMAGES:
+                        _raise_window(hwnd)
+                        return {"ok": True, "action": "browser", "window": title}
+        except Exception as e:
+            STATE["dash_err"] = str(e)
+    try:
+        webbrowser.open(url)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "action": "opened"}
+
+
 def widget_payload():
     cfg = widget_cfg_read()
     key = cfg.get("theme")
@@ -845,8 +972,13 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 gap_min = 30
             gap_min = max(1, min(1440, gap_min))
+            bucket_s = bucket_norm((query.get("bucket") or [BUCKET_DEFAULT])[0])
+            ua = self.headers.get("User-Agent", "")
+            if "Mozilla" in ua:
+                STATE["dash_seen"] = time.time()          # 有个浏览器标签开着看板
             try:
-                body = json.dumps(summarize(source=source, gap_min=gap_min), ensure_ascii=False)
+                body = json.dumps(summarize(source=source, gap_min=gap_min, bucket_s=bucket_s),
+                                  ensure_ascii=False)
                 self._send(200, body, "application/json; charset=utf-8")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}), "application/json")
@@ -870,6 +1002,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/api/dashboard/open":
+            self._send(200, json.dumps(dashboard_open(self.server.server_port), ensure_ascii=False),
+                       "application/json; charset=utf-8")
+            return
         if parsed.path == "/api/widget/open":
             self._send(200, json.dumps(widget_open(), ensure_ascii=False),
                        "application/json; charset=utf-8")
