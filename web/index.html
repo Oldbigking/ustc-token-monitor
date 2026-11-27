@@ -96,6 +96,10 @@ h2{font-size:12.5px;color:var(--dim);font-weight:550;margin:0 0 10px;letter-spac
   display:flex;align-items:center;gap:8px}
 h2 .hint{margin-left:auto;font-weight:400;letter-spacing:0}
 h2 .gapsel{font-size:11px;padding:2px 4px;border-radius:6px;letter-spacing:0;flex:none}
+h2 .lg{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:400;letter-spacing:0;color:var(--dim)}
+h2 .lg i{display:inline-block}
+h2 .lg i.sq{width:7px;height:7px;border-radius:2px;background:var(--green)}
+h2 .lg i.ln{width:11px;height:2px;border-radius:1px;background:var(--blue);margin-left:7px}
 section{margin-top:18px}
 
 /* ---------- 图表 ---------- */
@@ -209,7 +213,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
 
   <section class="one">
     <div class="card">
-      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span><select id="bucketSel" class="gapsel" title="图表细度：每格多宽。窗口固定 60 格，所以 30s≈近 30 分钟、1h≈近 60 小时"><option value="30">30 秒</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select></h2>
+      <h2>输出 token 与平均 tok/s<span class="lg" title="柱＝输出 token（左轴），折线＝tok/s（右轴）"><i class="sq"></i>token<i class="ln"></i>tok/s</span><span class="hint" id="minuteHint">1 分钟/格 · 近 1 小时</span><select id="bucketSel" class="gapsel" title="图表细度：每格多宽。窗口固定 60 格，所以 30s≈近 30 分钟、1h≈近 60 小时"><option value="30">30 秒</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select></h2>
       <svg class="chart" id="chartMinute"></svg>
     </div>
   </section>
@@ -703,16 +707,6 @@ let BUCKET_S = 60;
 function bucketLabel(s) {
   return s < 60 ? s + ' 秒' : s < 3600 ? (s / 60) + ' 分钟' : (s / 3600) + ' 小时';
 }
-/* 空档阈值这种"非整数分钟"的时长，得能写出 7.5m / 1h15m */
-function durTxt(s) {
-  if (s < 3600) {
-    const m = s / 60;
-    return (m % 1 ? m.toFixed(1) : m.toFixed(0)) + 'm';
-  }
-  const h = Math.floor(s / 3600);
-  const m = Math.round((s % 3600) / 60);
-  return h + 'h' + (m ? String(m).padStart(2, '0') + 'm' : '');
-}
 function spanLabel(spanS) {
   const m = Math.round((spanS || 3600) / 60);
   if (m < 90) return '近 ' + m + ' 分钟';
@@ -835,12 +829,10 @@ async function tick() {
   const hasBrk = win.some(m => m.brk);
   const bsEl = $('bucketSel');
   if (bsEl.value !== String(BUCKET_S)) bsEl.value = String(BUCKET_S);
-  const gapTxt = durTxt(d.gap_s || 0);
   $('minuteHint').textContent = !win.length
     ? '还没有调用记录'
-    : `细度 ${bucketLabel(d.bucket_s || BUCKET_S)} · ${spanLabel(d.span_s)}`
-      + (hasBrk ? ` · 空档 >${gapTxt} 折轴` : '')
-      + ' · 柱：输出 token（左轴）· 折线：tok/s（右轴）';
+    : `${bucketLabel(d.bucket_s || BUCKET_S)}/格 · ${spanLabel(d.span_s)}`
+      + (hasBrk ? ' · 空档已折叠' : '');
   chart('chartMinute', {
     kind: 'bar', color: '--green', fmtV: fx.tokY, unit: '输出 token',
     data: win.map(m => m.brk
