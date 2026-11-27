@@ -549,7 +549,7 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
             d, rem = divmod(m, 1440)
             return f"{d}d" + (f"{rem // 60}h" if rem >= 60 else "")
 
-        # 固定 15 格：空档长度的判定不看分钟数，只看"连着空了多少格"
+        # 固定 15 格：空档长度的判定不看分钟数，只看"连着空了多少格"（≥15 格即折）
         gap_cells = GAP_CELLS
         gap_s = gap_cells * bucket_s
         runs = {}                                           # 空档起点 -> 空档格数
@@ -561,7 +561,7 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
             j = i
             while j < len(raw) and not raw[j]["req"]:
                 j += 1
-            if j - i > gap_cells:
+            if j - i >= gap_cells:                          # 连着空 15 格（含）就算空档
                 runs[i] = j - i
             i = j
         i = 0
@@ -571,7 +571,7 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
                 to_ts = a0 + (i + ln) * bucket_s if i + ln < len(raw) else now
                 minutes_cut.append({
                     "brk": True, "gap_s": ln * bucket_s, "gap_label": _gap_label(ln * bucket_s),
-                    "from_local": local(a0 + i * 60).strftime("%m-%d %H:%M"),
+                    "from_local": local(a0 + i * bucket_s).strftime("%m-%d %H:%M"),
                     "to_local": local(to_ts).strftime("%m-%d %H:%M"),
                 })
                 i += ln
