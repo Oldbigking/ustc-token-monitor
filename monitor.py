@@ -782,7 +782,9 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
 # 对账：本机日志 vs 网关账单（改造自 codex-bridge/compare.py）
 # --------------------------------------------------------------------------- #
 KNOWN_GAPS = [
-    {"what": "账单比本地多约 110 条", "why": "网关把中断/失败请求也记成零 token 行",
+    {"what": "账单比本地多几十条", "why": "同 key 的其他客户端/工具调用 DSH 没记日志",
+     "handling": "金额差 ≈ 缺的未缓存 token × 2 元/1M"},
+    {"what": "账单比本地多约 110 条零 token", "why": "网关把中断/失败请求也记成行",
      "handling": "不追平，属预期"},
     {"what": "账单多约 17 条（10-29/10-30）", "why": "DSH 尚未开始记录用量",
      "handling": "忽略"},
