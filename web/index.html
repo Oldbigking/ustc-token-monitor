@@ -209,7 +209,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
 
   <section class="one">
     <div class="card">
-      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span><select id="bucketSel" class="gapsel" title="图表细度：每格多宽。窗口固定 60 格，所以 30s≈近 30 分钟、1h≈近 60 小时"><option value="30">30 秒</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select><select id="gapSel" class="gapsel" title="空档折叠阈值：超过这个时长的空档会压成一个断点"><option value="10">空档 10m</option><option value="30">空档 30m</option></select></h2>
+      <h2>每分钟输出 token 与平均 tok/s<span class="hint" id="minuteHint">近 60 分钟 · 柱：输出 token（左轴）· 折线：tok/s（右轴）</span><select id="bucketSel" class="gapsel" title="图表细度：每格多宽。窗口固定 60 格，所以 30s≈近 30 分钟、1h≈近 60 小时"><option value="30">30 秒</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select></h2>
       <svg class="chart" id="chartMinute"></svg>
     </div>
   </section>
@@ -696,28 +696,6 @@ function onHover(id, e) {
 /* ================= 渲染 ================= */
 const QS = new URLSearchParams(location.search);
 let CURRENT_SOURCE = QS.get('source') || '';
-const GAP_CHOICES = [10, 30];
-function initGap() {
-  const fromUrl = parseInt(QS.get('gap'), 10);
-  const fromLs = parseInt(localStorage.getItem('gapMin'), 10);
-  const v = GAP_CHOICES.includes(fromUrl) ? fromUrl
-    : GAP_CHOICES.includes(fromLs) ? fromLs : 30;
-  const sel = $('gapSel');
-  sel.innerHTML = GAP_CHOICES.map(m =>
-    '<option value="' + m + '">空档 ' + (m >= 60 ? (m / 60) + 'h' : m + 'm') + '</option>').join('');
-  sel.value = String(v);
-  sel.addEventListener('change', () => {
-    const next = parseInt(sel.value, 10) || 30;
-    GAP_MIN = next;                       // 关键：立刻生效，tick() 才会带新阈值请求
-    localStorage.setItem('gapMin', String(next));
-    const q = new URLSearchParams(location.search);
-    q.set('gap', String(next));
-    history.replaceState(null, '', '?' + q.toString());
-    tick();
-  });
-  return v;
-}
-let GAP_MIN = 30;
 const BUCKET_CHOICES = [30, 60, 300, 900, 1800, 3600];
 let BUCKET_S = 60;
 
@@ -725,11 +703,21 @@ let BUCKET_S = 60;
 function bucketLabel(s) {
   return s < 60 ? s + ' 秒' : s < 3600 ? (s / 60) + ' 分钟' : (s / 3600) + ' 小时';
 }
+/* 空档阈值这种"非整数分钟"的时长，得能写出 7.5m / 1h15m */
+function durTxt(s) {
+  if (s < 3600) {
+    const m = s / 60;
+    return (m % 1 ? m.toFixed(1) : m.toFixed(0)) + 'm';
+  }
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  return h + 'h' + (m ? String(m).padStart(2, '0') + 'm' : '');
+}
 function spanLabel(spanS) {
   const m = Math.round((spanS || 3600) / 60);
   if (m < 90) return '近 ' + m + ' 分钟';
   const h = m / 60;
-  return '近 ' + (h < 10 ? h.toFixed(1) : Math.round(h)) + ' 小时';
+  return '近 ' + (h % 1 ? h.toFixed(1) : h.toFixed(0)) + ' 小时';
 }
 
 function initBucket() {
@@ -786,7 +774,6 @@ async function tick() {
   try {
     const qp = new URLSearchParams();
     if (CURRENT_SOURCE) qp.set('source', CURRENT_SOURCE);
-    qp.set('gap', String(GAP_MIN));
     qp.set('bucket', String(BUCKET_S));
     const q = '?' + qp.toString();
     d = await (await fetch('/api/summary' + q, { cache: 'no-store' })).json();
@@ -846,15 +833,9 @@ async function tick() {
   /* 折轴时间线：超过阈值的空档被压成一个断点格子 */
   const win = d.minutes_cut || [];
   const hasBrk = win.some(m => m.brk);
-  const gsel = $('gapSel');
-  if (gsel.value !== String(GAP_MIN)) gsel.value = String(GAP_MIN);
-  const gs = $('gapSel');
-  if (gs.value !== String(GAP_MIN)) gs.value = String(GAP_MIN);
   const bsEl = $('bucketSel');
   if (bsEl.value !== String(BUCKET_S)) bsEl.value = String(BUCKET_S);
-  const gapTxt = (d.gap_s || 0) >= 3600
-    ? ((d.gap_s / 3600).toFixed(d.gap_s % 3600 ? 1 : 0) + 'h')
-    : Math.round((d.gap_s || 0) / 60) + 'm';
+  const gapTxt = durTxt(d.gap_s || 0);
   $('minuteHint').textContent = !win.length
     ? '还没有调用记录'
     : `细度 ${bucketLabel(d.bucket_s || BUCKET_S)} · ${spanLabel(d.span_s)}`
@@ -986,7 +967,6 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 });
 
 applyTheme(mode, false);
-GAP_MIN = initGap();
 BUCKET_S = initBucket();
 wkLoad();
 tick();

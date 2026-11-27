@@ -417,6 +417,9 @@ def build_sources(allrows):
 # 折轴图的细度：格子宽度（秒）。窗口固定 60 格，所以 30s ≈ 近 30 分钟、1h ≈ 近 60 小时
 BUCKET_CHOICES = (30, 60, 300, 900, 1800, 3600)
 BUCKET_DEFAULT = 60
+# 空档折叠阈值：固定 15 格，换算成时间就是 15 × 细度
+# （30s→7.5m，1m→15m，5m→1h15m，15m→3h45m，30m→7h30m，1h→15h）
+GAP_CELLS = 15
 
 
 def bucket_norm(v):
@@ -428,7 +431,8 @@ def bucket_norm(v):
     return min(BUCKET_CHOICES, key=lambda x: abs(x - v))
 
 
-def summarize(window_hours=1.0, recent=12, source=None, gap_min=30, bucket_s=BUCKET_DEFAULT):
+def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=BUCKET_DEFAULT):
+    # gap_min 保留只为兼容旧调用方；空档阈值现在固定按 GAP_CELLS 格算，与细度联动
     now = time.time()
     day_start = local(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     w_start = now - window_hours * 3600
@@ -515,7 +519,7 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30, bucket_s=BUC
     # 折轴（时间轴压缩）：单段空档超过阈值（默认 30 分钟）就压成一个断点格子，其余照常；
     # 这样闲置几小时后仍能看到"上次活动长什么样 —— 空了多久 —— 现在"。
     minutes_cut = []
-    gap_s = gap_min * 60
+    gap_s = GAP_CELLS * bucket_s
     last_any = max((r["t0"] for r in allrows), default=None)
     if last_any is not None:
         lo = min(now - 48 * 3600, last_any - 1800)          # 至少覆盖上一次活动
@@ -545,8 +549,8 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30, bucket_s=BUC
             d, rem = divmod(m, 1440)
             return f"{d}d" + (f"{rem // 60}h" if rem >= 60 else "")
 
-        # 阈值按格数算：细度 1h、阈值 30m 时其实一格（1h）就算空档
-        gap_cells = max(1, int(round(gap_min * 60.0 / bucket_s)))
+        # 固定 15 格：空档长度的判定不看分钟数，只看"连着空了多少格"
+        gap_cells = GAP_CELLS
         gap_s = gap_cells * bucket_s
         runs = {}                                           # 空档起点 -> 空档格数
         i = 0
@@ -673,7 +677,7 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30, bucket_s=BUC
         "budgets": budgets,
         "minutes": minutes,
         "minutes_cut": minutes_cut,
-        "gap_min": gap_min,
+        "gap_cells": GAP_CELLS,
         "gap_s": gap_s,
         "bucket_s": bucket_s,
         "points": 60,
@@ -968,18 +972,12 @@ class Handler(BaseHTTPRequestHandler):
             STATE.setdefault("hits", collections.deque(maxlen=200)).append(
                 (time.time(), self.headers.get("User-Agent", "")[:60]))
             source = (query.get("source") or [None])[0] or None
-            try:
-                gap_min = int((query.get("gap") or ["30"])[0])
-            except (TypeError, ValueError):
-                gap_min = 30
-            gap_min = max(1, min(1440, gap_min))
             bucket_s = bucket_norm((query.get("bucket") or [BUCKET_DEFAULT])[0])
             ua = self.headers.get("User-Agent", "")
             if "Mozilla" in ua:
                 STATE["dash_seen"] = time.time()          # 有个浏览器标签开着看板
             try:
-                body = json.dumps(summarize(source=source, gap_min=gap_min, bucket_s=bucket_s),
-                                  ensure_ascii=False)
+                body = json.dumps(summarize(source=source, bucket_s=bucket_s), ensure_ascii=False)
                 self._send(200, body, "application/json; charset=utf-8")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}), "application/json")
