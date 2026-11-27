@@ -475,8 +475,8 @@ function draw(id) {
          '" fill="' + P.dim + '" font-size="12" text-anchor="middle">暂无数据</text>';
   }
 
-  /* 折线：断点格子、以及"没请求的空格"都断开；connect=true 时，只有"有请求但没采样到
-     tok/s"（那格没算出解码耗时）才跳过点继续连 —— 空档之间不会连成假趋势 */
+  /* 折线：只在折轴断点格子处断开（跨过空档不连）；断点之间属于同一连续时段，
+     中间没采到 tok/s 的格子只是跳过这个点，线继续连（connect=true 的图） */
   const lineSvg = (arr, yFn, color, connect) => {
     let out = '', seg = [];
     const flush = () => {
@@ -495,7 +495,7 @@ function draw(id) {
       seg = [];
     };
     arr.forEach((d, i) => {
-      if (d.brk || d.empty) { flush(); return; }
+      if (d.brk) { flush(); return; }
       if (d.v === null || d.v === undefined) { if (!connect) flush(); return; }
       const v = Number(d.v);
       if (!isFinite(v)) { if (!connect) flush(); return; }
@@ -835,8 +835,8 @@ async function tick() {
           extra: m.req + ' 次 · 入 ' + fmt(m.prompt) + ' / 出 ' + fmt(m.completion) }),
     s2: {
       color: '--blue', fmtV: fx.tpsY, unit: 'tok/s', connect: true,
-      data: win.map(m => ({ t: m.t_local, v: m.brk ? null : m.tps,
-                           empty: !m.brk && !m.req })),
+      /* 断点格子必须带 brk，否则折线会跨着空档连过去 */
+      data: win.map(m => ({ t: m.t_local, v: m.brk ? null : m.tps, brk: !!m.brk })),
     },
   });
 
