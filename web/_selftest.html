@@ -263,6 +263,41 @@ function run() {
   if (!okTip2) fails.push('联动提示');
   if (!okAlign) fails.push('横轴对齐');
 
+  /* 折线连续性：同一段内的空值只是缺采样（connect），断点格子才是真断开 */
+  const lineCount = (connect, extra) => {
+    const id = 'tsConn' + (++seq);
+    const el = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    el.setAttribute('id', id);
+    el.setAttribute('class', 'chart');
+    el.style.cssText = 'display:block;width:600px;height:190px';
+    doc.body.appendChild(el);
+    w.applyTheme('light', false);
+    const src2 = extra
+      ? [{ t: '1', v: 10 }, { t: '2', v: 20 }, { t: '3', brk: true, gap_label: '2h' }, { t: '4', v: 40 }, { t: '5', v: 50 }]
+      : [{ t: '1', v: 10 }, { t: '2', v: 20 }, { t: '3', v: null }, { t: '4', v: 40 }, { t: '5', v: 50 }];
+    w.chart(id, {
+      kind: 'bar', color: '--green', fmtV: v => String(Math.round(v)),
+      data: [{ t: '1', v: 5 }, { t: '2', v: 6 }, { t: '3', v: 7 }, { t: '4', v: 8 }, { t: '5', v: 9 }],
+      s2: { color: '--blue', fmtV: v => String(Math.round(v)), unit: 'tok/s', connect, data: src2 },
+    });
+    const polys = [...el.querySelectorAll('polyline')].map(p => p.getAttribute('points').split(' ').length);
+    return polys;
+  };
+  const connOn = lineCount(true, false);
+  const connOff = lineCount(false, false);
+  const connBrk = lineCount(true, true);
+  const connOk = connOn.length === 1 && connOn[0] === 4
+    && connOff.length === 2
+    && connBrk.length === 2;
+  checked++;
+  if (!connOk) {
+    fails.push('折线连续');
+    log.push('FAIL 折线连续 connect=' + JSON.stringify(connOn) +
+      ' plain=' + JSON.stringify(connOff) + ' 断点=' + JSON.stringify(connBrk));
+  } else {
+    log.push('ok   折线连续（段内 1 条 4 点 / 不连 2 条 / 断点 2 条）');
+  }
+
   /* 纵轴贴合度：数据最大值 / 轴上限 应 >= 0.78（旧算法 118 → 200 只有 0.59） */
   const axCases = [[117.7, 125], [4004, 5000], [53.7, 66], [2170, 2600], [1.2e6, 1.4e6]];
   const axBad = [];

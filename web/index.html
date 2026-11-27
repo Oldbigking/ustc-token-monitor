@@ -213,7 +213,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
 
   <section class="one">
     <div class="card">
-      <h2>输出 token 与平均 tok/s<span class="lg" title="柱＝输出 token（左轴），折线＝tok/s（右轴）"><i class="sq"></i>token<i class="ln"></i>tok/s</span><span class="hint" id="minuteHint">1 分钟/格 · 近 1 小时</span><select id="bucketSel" class="gapsel" title="图表细度：每格多宽。窗口固定 60 格，所以 30s≈近 30 分钟、1h≈近 60 小时"><option value="30">30 秒</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select></h2>
+      <h2>输出 token 与平均 tok/s<span class="lg" title="柱＝输出 token（左轴），折线＝tok/s（右轴）"><i class="sq"></i>token<i class="ln"></i>tok/s</span><select id="bucketSel" class="gapsel" title="图表细度：每格多宽。窗口固定 60 格，所以 30s≈近 30 分钟、1h≈近 60 小时"><option value="30">30 秒</option><option value="60">1 分钟</option><option value="300">5 分钟</option><option value="900">15 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option></select></h2>
       <svg class="chart" id="chartMinute"></svg>
     </div>
   </section>
@@ -377,7 +377,9 @@ function chart(id, opts) {
   st.ref = opts.ref || null;
   st.data = opts.data || [];
   /* 第二序列：共用横轴、独立右轴（例如柱=token，线=tok/s） */
+  st.connect = !!opts.connect;
   st.s2 = opts.s2 ? {
+    connect: !!opts.s2.connect,
     data: opts.s2.data || [],
     colorVar: opts.s2.color,
     fmtV: opts.s2.fmtV || (v => fmt(v)),
@@ -473,8 +475,8 @@ function draw(id) {
          '" fill="' + P.dim + '" font-size="12" text-anchor="middle">暂无数据</text>';
   }
 
-  /* 折线（可分段，遇到 null 断开，不连成假趋势） */
-  const lineSvg = (arr, yFn, color) => {
+  /* 折线：遇到断点格子断开；connect=true 时，段内的空值只是"没有采样"，跳过点继续连 */
+  const lineSvg = (arr, yFn, color, connect) => {
     let out = '', seg = [];
     const flush = () => {
       if (seg.length) {
@@ -492,9 +494,10 @@ function draw(id) {
       seg = [];
     };
     arr.forEach((d, i) => {
-      if (d.brk || d.v === null || d.v === undefined) { flush(); return; }
+      if (d.brk) { flush(); return; }
+      if (d.v === null || d.v === undefined) { if (!connect) flush(); return; }
       const v = Number(d.v);
-      if (!isFinite(v)) { flush(); return; }
+      if (!isFinite(v)) { if (!connect) flush(); return; }
       seg.push([cxOf(i), yFn(v)]);
     });
     flush();
@@ -529,9 +532,9 @@ function draw(id) {
       lastRight = cx + lw / 2;
     });
   } else {
-    s += lineSvg(data, yy, st.color);
+    s += lineSvg(data, yy, st.color, st.connect);
   }
-  if (dual) s += lineSvg(s2.data, y2, s2.color);
+  if (dual) s += lineSvg(s2.data, y2, s2.color, s2.connect);
 
   /* 折轴标记：空档处一根竖虚线 + 斜杠符号，表示这里跳过了多久 */
   data.forEach((d, i) => {
@@ -707,12 +710,6 @@ let BUCKET_S = 60;
 function bucketLabel(s) {
   return s < 60 ? s + ' 秒' : s < 3600 ? (s / 60) + ' 分钟' : (s / 3600) + ' 小时';
 }
-function spanLabel(spanS) {
-  const m = Math.round((spanS || 3600) / 60);
-  if (m < 90) return '近 ' + m + ' 分钟';
-  const h = m / 60;
-  return '近 ' + (h % 1 ? h.toFixed(1) : h.toFixed(0)) + ' 小时';
-}
 
 function initBucket() {
   const fromUrl = parseInt(QS.get('bucket'), 10);
@@ -826,13 +823,8 @@ async function tick() {
   /* 图表 */
   /* 折轴时间线：超过阈值的空档被压成一个断点格子 */
   const win = d.minutes_cut || [];
-  const hasBrk = win.some(m => m.brk);
   const bsEl = $('bucketSel');
   if (bsEl.value !== String(BUCKET_S)) bsEl.value = String(BUCKET_S);
-  $('minuteHint').textContent = !win.length
-    ? '还没有调用记录'
-    : `${bucketLabel(d.bucket_s || BUCKET_S)}/格 · ${spanLabel(d.span_s)}`
-      + (hasBrk ? ' · 空档已折叠' : '');
   chart('chartMinute', {
     kind: 'bar', color: '--green', fmtV: fx.tokY, unit: '输出 token',
     data: win.map(m => m.brk
@@ -841,7 +833,7 @@ async function tick() {
       : { t: m.t_local, v: m.completion,
           extra: m.req + ' 次 · 入 ' + fmt(m.prompt) + ' / 出 ' + fmt(m.completion) }),
     s2: {
-      color: '--blue', fmtV: fx.tpsY, unit: 'tok/s',
+      color: '--blue', fmtV: fx.tpsY, unit: 'tok/s', connect: true,
       data: win.map(m => ({ t: m.t_local, v: m.brk ? null : m.tps })),
     },
   });
