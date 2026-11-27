@@ -851,39 +851,102 @@ def _proc_image(pid):
     return ""
 
 
-def _raise_window(hwnd):
+def _force_foreground(hwnd):
+    """把窗口恢复/最大化并真正抢到前台。
+
+    后台进程直接 SetForegroundWindow 常被系统的"防抢焦点"挡下来（返回 0、窗口不动），
+    所以这里先把自己的输入线程挂到当前前台窗口上，失败再模拟一次 ALT 解锁。
+    """
     import ctypes
     u = ctypes.windll.user32
-    u.ShowWindow(hwnd, 9)                            # SW_RESTORE（最小化也能救回来）
+    k = ctypes.windll.kernel32
+    if u.IsIconic(hwnd):
+        u.ShowWindow(hwnd, 9)                        # SW_RESTORE：最小化也救回来
+    if not u.IsZoomed(hwnd):
+        u.ShowWindow(hwnd, 3)                        # SW_MAXIMIZE：别以小窗口出现
+    fg = u.GetForegroundWindow()
+    tid_fg = u.GetWindowThreadProcessId(fg, None) if fg else 0
+    tid_me = k.GetCurrentThreadId()
+    attached = False
+    if tid_fg and tid_fg != tid_me:
+        try:
+            attached = bool(u.AttachThreadInput(tid_me, tid_fg, True))
+        except Exception:
+            attached = False
     ok = bool(u.SetForegroundWindow(hwnd))
+    if not ok:
+        VK_ALT, KEYUP = 0x12, 0x0002
+        u.keybd_event(VK_ALT, 0, 0, 0)
+        u.keybd_event(VK_ALT, 0, KEYUP, 0)
+        ok = bool(u.SetForegroundWindow(hwnd))
     u.BringWindowToTop(hwnd)
+    try:
+        u.SwitchToThisWindow(hwnd, True)             # 最后一招，比 SetForegroundWindow 更硬
+    except Exception:
+        pass
+    if attached:
+        try:
+            u.AttachThreadInput(tid_me, tid_fg, False)
+        except Exception:
+            pass
     return ok
 
 
+_raise_window = _force_foreground                     # 兼容旧调用点
+
+
+def _find_dash_window():
+    """(hwnd, 标题)：正在显示看板的窗口；没有返回 None。"""
+    try:
+        for hwnd, title, _pid, _cls, vis in _enum_windows():
+            if vis and DASHBOARD_TITLE in title:
+                return hwnd, title
+    except Exception as e:
+        STATE["dash_err"] = str(e)
+    return None
+
+
+def _watch_and_raise(seconds=8.0):
+    """浏览器冷启动要几秒才有窗口，后台等它出现再最大化抬前台（不阻塞请求）。"""
+    def run():
+        end = time.time() + seconds
+        while time.time() < end:
+            hit = _find_dash_window()
+            if hit:
+                _force_foreground(hit[0])
+                return
+            time.sleep(0.2)
+    threading.Thread(target=run, daemon=True).start()
+
+
 def dashboard_open(port=8790):
-    """已经有看板窗口就抬到最前；只有在找不到时才新开标签页。"""
+    """有看板窗口就最大化抬到最前；没有就先把标签页开出来，再等窗口出现抬起来。"""
     url = f"http://127.0.0.1:{port}/"
     if sys.platform == "win32":
-        try:
-            wins = _enum_windows()
-            for hwnd, title, _pid, _cls, vis in wins:
-                if vis and DASHBOARD_TITLE in title:
-                    _raise_window(hwnd)
-                    return {"ok": True, "action": "focused", "window": title}
-            # 看板标签在后台时窗口标题不是它，就把浏览器主窗口抬上来（最近 45 秒内见过看板）
-            if time.time() - (STATE.get("dash_seen") or 0) < 45:
-                for hwnd, title, pid, cls, vis in wins:
-                    if not vis or not title or cls != "Chrome_WidgetWin_1":
-                        continue
-                    if _proc_image(pid) in BROWSER_IMAGES:
-                        _raise_window(hwnd)
-                        return {"ok": True, "action": "browser", "window": title}
-        except Exception as e:
-            STATE["dash_err"] = str(e)
+        hit = _find_dash_window()
+        if hit:
+            _force_foreground(hit[0])
+            return {"ok": True, "action": "focused", "window": hit[1]}
+    if sys.platform == "win32" and time.time() - (STATE.get("dash_open_at") or 0) < 2.5:
+        # 刚开过（连点/双击）：别再堆一个标签页，把现有的浏览器窗口抬起来就行
+        for hwnd, title, pid, cls, vis in _enum_windows():
+            if vis and title and cls == "Chrome_WidgetWin_1" and _proc_image(pid) in BROWSER_IMAGES:
+                _force_foreground(hwnd)
+                return {"ok": True, "action": "browser", "window": title}
+    opened = False
     try:
-        webbrowser.open(url)
+        opened = webbrowser.open(url)
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        STATE["dash_err"] = str(e)
+    STATE["dash_open_at"] = time.time()
+    if not opened:
+        try:
+            os.startfile(url)                        # 浏览器关联坏了时的兜底
+            opened = True
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    if sys.platform == "win32":
+        _watch_and_raise()
     return {"ok": True, "action": "opened"}
 
 

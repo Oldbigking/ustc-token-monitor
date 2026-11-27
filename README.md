@@ -171,7 +171,7 @@ curl.exe -s http://127.0.0.1:8790/api/summary | ConvertFrom-Json | Select last_e
 |---|---|
 | 拖动 | 移位，位置记在配置里，下次启动原地出现 |
 | 右上 `✕` | 关闭（hover 变红） |
-| 右上 `看板 ↗` | 打开完整看板（等价于双击卡片）；**已有看板窗口就直接抬到最前**，不会每点一次多开一个标签页 |
+| 右上 `看板 ↗` | 打开完整看板（等价于双击卡片）；**已有看板窗口就直接抬到最前并最大化**，不会每点一次多开一个标签页 |
 | 右键 | 自绘圆角菜单：打开看板 / 迷你模式（200×62）/ 始终置顶 / 退出 |
 | Ctrl + 滚轮 | 调透明度（0.35–1.0） |
 | 采集失败 | 左上圆点变红，底部给出人话错误（如 `⚠ 平台返回 503（平台暂时不可用）`） |
@@ -194,7 +194,7 @@ python  widget.py          :: 带控制台，便于看报错
 
 ```
 GET  /api/summary?bucket=300      -> 折轴图细度（秒），窗口固定 60 格
-POST /api/dashboard/open          -> 打开看板：已有窗口就抬到最前，否则新开
+POST /api/dashboard/open          -> 打开看板：已有窗口就恢复/最大化并抢到前台，否则新开
 GET  /api/widget                  -> {theme, colors, themes}
 POST /api/widget?theme=mint       -> 写入 %APPDATA%\ustc-token-monitor\widget.json
 ```
