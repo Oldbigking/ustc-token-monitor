@@ -782,8 +782,8 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
 # 对账：本机日志 vs 网关账单（改造自 codex-bridge/compare.py）
 # --------------------------------------------------------------------------- #
 KNOWN_GAPS = [
-    {"what": "账单比本地多几十条", "why": "同 key 的其他客户端/工具调用 DSH 没记日志",
-     "handling": "金额差 ≈ 缺的未缓存 token × 2 元/1M"},
+    {"what": "账单比本机多出一些调用", "why": "其它机器 / 其它客户端用同一把 key 的调用，本机日志看不到",
+     "handling": "差额即其它设备的用量，属覆盖范围差，不是估算误差"},
     {"what": "账单比本地多约 110 条零 token", "why": "网关把中断/失败请求也记成行",
      "handling": "不追平，属预期"},
     {"what": "账单多约 17 条（10-29/10-30）", "why": "DSH 尚未开始记录用量",
@@ -810,6 +810,11 @@ def reconcile(days=30, provider=None):
     """逐日对账：本机日志（估算口径） vs requests 里 usage_source='billing' 的账单行。
 
     只读接口：不改库、不改数据。days 为回看天数（含今天）。
+
+    口径：账单是该 provider **所有机器/客户端**的合计，本机日志只覆盖本机，
+    所以 bill - local 是"其它设备的用量"（other），不是估算误差。
+    合计另给 total_complete（不含今天），避免账单侧没拉全时假 FAIL。
+
     provider 为 None 时只对比"账单里真正出现过的 provider"（默认就是 ustc），
     本机日志里那些没走网关的 provider（例如别人代充的账号）单独列在 unbilled，
     否则它们会被算成"对不上"，看起来像 bug。
@@ -924,9 +929,17 @@ def reconcile(days=30, provider=None):
                 "spend_pct": pct(L["spend"] or 0, B["spend"] or 0),
                 "tps_pct": pct(L["tps"] or 0, B["tps"] or 0),
             },
+            # 账单 − 本机 = 这天其它设备/客户端的用量（负值=账单侧还没拉全）
+            "other": {
+                "req": B["req"] - L["req"],
+                "tokens": B["tokens"] - L["tokens"],
+                "spend": round((B["spend"] or 0) - (L["spend"] or 0), 3),
+            },
         })
 
     TL, TB = _rzero(), _rzero()
+    TLC, TBC = _rzero(), _rzero()          # 只统计"已经走完"的日子（今天两边都不完整）
+    today = local(now).date().isoformat()
     for k in set(loc_cmp) | set(bil):
         for tgt, src_map in ((TL, loc_cmp), (TB, bil)):
             x = src_map.get(k)
@@ -935,7 +948,37 @@ def reconcile(days=30, provider=None):
             for f in ("n", "prompt", "completion", "spend", "known", "dec", "comp"):
                 tgt[f] += x[f]
             tgt["ttf"].extend(x["ttf"])
+        if k < today:
+            for tgt, src_map in ((TLC, loc_cmp), (TBC, bil)):
+                x = src_map.get(k)
+                if not x:
+                    continue
+                for f in ("n", "prompt", "completion", "spend", "known", "dec", "comp"):
+                    tgt[f] += x[f]
+                tgt["ttf"].extend(x["ttf"])
     L, B = pack(TL), pack(TB)
+    LC, BC = pack(TLC), pack(TBC)
+    # 账单 = 该 provider 的合计（含其它机器/客户端）；本机日志只覆盖本机。
+    # 两者相减 = 本机之外的用量，不是"估算偏心"。今天两边都不完整，不计入合计。
+    bill_last = max((r.get("t0") or 0 for r in bill_rows), default=0)
+    stale = bool(bill_last) and (now - bill_last) > 900
+    today = local(now).date().isoformat()
+    o_req = o_tok = 0
+    o_sp = 0.0
+    for row in out:
+        if row["date"] >= today:
+            continue
+        o_req += row["other"]["req"]
+        o_tok += row["other"]["tokens"]
+        o_sp += row["other"]["spend"]
+    other = {
+        "req": o_req, "tokens": o_tok, "spend": round(o_sp, 3),
+        "excludes_today": True,
+        # 账单侧最后一次采集：local 模式下它会停在最后一次 api 拉取的时刻，
+        # 此时"今天"那一段本机会比账单多，逐日 other 出现负数是正常的
+        "bill_last": local(bill_last).strftime("%Y-%m-%d %H:%M") if bill_last else None,
+        "bill_stale": stale,
+    }
     return {
         "ok": True,
         "days": days,
@@ -943,6 +986,13 @@ def reconcile(days=30, provider=None):
         "compared_providers": cmp_prov,
         "billing_providers": sorted(bil_prov),
         "since_local": local(since).strftime("%Y-%m-%d %H:%M"),
+        "scope": {
+            "local": "本机 DSH 会话日志（单机口径）",
+            "bill": "网关账单（该 provider 全部机器/客户端的合计）",
+            "note": "bill − local = 其它设备/客户端的用量（覆盖范围差，不是估算误差）；"
+                    "账单停止更新时今天那段会倒挂，见 other.bill_stale",
+        },
+        "other": other,
         "daily": out,
         "total": {
             "local": L, "bill": B,
@@ -952,6 +1002,17 @@ def reconcile(days=30, provider=None):
                 "spend_pct": pct(L["spend"] or 0, B["spend"] or 0),
                 "tps_pct": pct(L["tps"] or 0, B["tps"] or 0),
                 "ttft_pct": pct(L["ttft_ms"] or 0, B["ttft_ms"] or 0),
+            },
+        },
+        # 只统计"已经走完"的日子：今天账单侧可能还没拉全，混进来会假 FAIL
+        "total_complete": {
+            "local": LC, "bill": BC,
+            "diff": {
+                "req": LC["req"] - BC["req"],
+                "prompt_pct": pct(LC["prompt"], BC["prompt"]),
+                "spend_pct": pct(LC["spend"] or 0, BC["spend"] or 0),
+                "tps_pct": pct(LC["tps"] or 0, BC["tps"] or 0),
+                "ttft_pct": pct(LC["ttft_ms"] or 0, BC["ttft_ms"] or 0),
             },
         },
         # 本机日志里有、但网关账单里没有的 provider（没走这个网关，不该算作"对不上"）
