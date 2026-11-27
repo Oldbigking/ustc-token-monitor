@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "effective_from": "2026-11-01",
+  "_comment": "单价单位：元 / 1M tokens。无账单可反解时按平台公开价填；键为 provider/model，也支持 provider/* 与 */model，缺省用 default。",
+  "default": {
+    "uncached": 0.6307,
+    "cache_read": 0.212,
+    "output": 4.1905
+  },
+  "prices": {
+    "ustc/deepseek-flash": {
+      "uncached": 0.6307,
+      "cache_read": 0.212,
+      "output": 4.1905
+    },
+    "deepseek-account/deepseek-flash": {
+      "uncached": 0.6307,
+      "cache_read": 0.212,
+      "output": 4.1905
+    },
+    "relay-a/deepseek-flash": {
+      "uncached": 0.8514,
+      "cache_read": 0.2862,
+      "output": 5.6572
+    }
+  }
+}

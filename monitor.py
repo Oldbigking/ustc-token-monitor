@@ -3,7 +3,7 @@
 """
 USTC 大模型平台 Token 速率监测器
 --------------------------------
-数据源: LiteLLM Proxy 只读账单接口 (/spend/logs/v2, /key/info)
+数据源: 默认本机 DSH 会话日志（零密钥、零网络）；--source api 可选网关账单
 指标  : 平均生成速度 (tok/s)、1h 用量、3h/12h 限额进度、全天用量与费用
 
 用法:
@@ -11,8 +11,8 @@ USTC 大模型平台 Token 速率监测器
   python monitor.py --serve          # 常驻采集 + 看板 http://127.0.0.1:8790
   python monitor.py --serve --port 9000
 
-依赖: 仅 Python 标准库 (3.9+)
-密钥: 环境变量 USTC_API_KEY，缺失时回退读取 ~/.dsh/.credentials.yaml，仅驻留内存
+依赖: 标准库 + zstandard（仅 Python<3.14 读 .jsonl.zstd 需要；3.14+ 内置 compression.zstd）
+密钥: local 模式完全不读凭证；api 模式读 USTC_API_KEY 或 ~/.dsh/.credentials.yaml
 """
 
 import argparse
@@ -39,6 +39,12 @@ POLL_SECONDS = 10
 BUDGET_REFRESH_SECONDS = 60
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "usage.db")
+
+# 数据源：local（本机 DSH 会话日志，默认、零密钥）| api（网关账单）| both（账单优先）
+SOURCE_CHOICES = ("local", "api", "both")
+SOURCE = (os.environ.get("USTC_TOKEN_SOURCE") or "local").strip().lower()
+if SOURCE not in SOURCE_CHOICES:
+    SOURCE = "local"
 
 MASK = lambda k: (k[:3] + "..." + k[-4:]) if k and len(k) > 10 else "***"
 
@@ -91,7 +97,15 @@ def load_key():
     return "", None
 
 
-KEY, KEY_SRC = load_key()
+# 懒加载：local 模式绝不触碰凭证文件（零密钥承诺）；只有 api 路径才会调 ensure_key()
+KEY, KEY_SRC = "", None
+
+
+def ensure_key():
+    global KEY, KEY_SRC
+    if not KEY:
+        KEY, KEY_SRC = load_key()
+    return KEY
 
 
 _OPENER = None
@@ -114,6 +128,9 @@ def _builder():
 
 
 def api_get(path, params=None, timeout=25):
+    if not ensure_key():
+        raise RuntimeError("未配置 API Key：设置 USTC_API_KEY 或写进 ~/.dsh/.credentials.yaml，"
+                           "也可以改用 --source local（本机日志，无需密钥）")
     url = BASE + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -134,7 +151,9 @@ CREATE TABLE IF NOT EXISTS requests (
     t0 REAL, t1 REAL, t2 REAL,
     model TEXT, mgroup TEXT, prompt INTEGER, completion INTEGER,
     cached INTEGER, reasoning INTEGER,
-    spend REAL, user_agent TEXT, finish TEXT
+    spend REAL, user_agent TEXT, finish TEXT,
+    provider TEXT NOT NULL DEFAULT 'ustc',
+    usage_source TEXT NOT NULL DEFAULT 'billing'
 );
 CREATE INDEX IF NOT EXISTS idx_t0 ON requests(t0);
 CREATE TABLE IF NOT EXISTS budget_snap (
@@ -156,6 +175,12 @@ def init_db():
         cols = {r["name"] for r in c.execute("PRAGMA table_info(requests)")}
         if "mgroup" not in cols:
             c.execute("ALTER TABLE requests ADD COLUMN mgroup TEXT")
+        # 老库没有这两列：provider 区分平台，usage_source 区分"账单真值 / 单价估算"
+        if "provider" not in cols:
+            c.execute("ALTER TABLE requests ADD COLUMN provider TEXT NOT NULL DEFAULT 'ustc'")
+        if "usage_source" not in cols:
+            c.execute("ALTER TABLE requests ADD COLUMN usage_source TEXT NOT NULL DEFAULT 'billing'")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_prov_t0 ON requests(provider, t0)")
         # 老数据没有 model_group，用 model 顶上（两者在平台上几乎总是同名）
         c.execute("UPDATE requests SET mgroup = model WHERE mgroup IS NULL OR mgroup = ''")
 
@@ -163,15 +188,18 @@ def init_db():
 def upsert_rows(rows):
     if not rows:
         return 0
+    # 列顺序必须与 sources.dsh_log.ROW_COLUMNS / row_to_tuple 完全一致
     sql = """INSERT INTO requests
-             (request_id,t0,t1,t2,model,mgroup,prompt,completion,cached,reasoning,spend,user_agent,finish)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             (request_id,t0,t1,t2,model,mgroup,prompt,completion,cached,reasoning,spend,
+              user_agent,finish,provider,usage_source)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(request_id) DO UPDATE SET
                t0=excluded.t0, t1=excluded.t1, t2=excluded.t2, model=excluded.model,
                mgroup=excluded.mgroup,
                prompt=excluded.prompt, completion=excluded.completion, cached=excluded.cached,
                reasoning=excluded.reasoning, spend=excluded.spend,
-               user_agent=excluded.user_agent, finish=excluded.finish"""
+               user_agent=excluded.user_agent, finish=excluded.finish,
+               provider=excluded.provider, usage_source=excluded.usage_source"""
     with db() as c:
         before = c.total_changes
         c.executemany(sql, rows)
@@ -199,6 +227,8 @@ def row_to_tuple(r):
         float(r.get("spend") or 0.0),
         (meta.get("user_agent") or "")[:120],
         r.get("finish_reason") or "",
+        "ustc",          # provider：账单行都来自 USTC 网关
+        "billing",       # usage_source：金额是账单真值
     )
 
 
@@ -213,6 +243,8 @@ STATE = {
     "budget": None,
     "budget_ts": 0.0,
     "key_info": None,
+    "source": SOURCE,
+    "local_events": 0,
 }
 LOCK = threading.Lock()
 
@@ -387,6 +419,35 @@ def poll_once(verbose=True, full=False, force_full=None):
         return -1
 
 
+def poll_local(verbose=True):
+    """扫描本机 DSH 会话日志 → upsert（幂等，重复跑行数不变）。不读密钥、不发请求。"""
+    try:
+        from sources.dsh_log import as_rows, load_events
+        events = load_events()
+        rows = as_rows(events)
+        changed = upsert_rows(rows)
+        with LOCK:
+            STATE.update(last_ok=time.time(), last_err=None, polls=STATE["polls"] + 1,
+                         rows=len(rows), local_events=len(events))
+        return changed
+    except Exception as e:
+        with LOCK:
+            STATE["last_err"] = _err_text(e)
+            STATE["polls"] += 1
+        if verbose:
+            print(f"本地日志采集失败: {_err_text(e)}", file=sys.stderr)
+        return -1
+
+
+def _usage_of(r):
+    return r.get("usage_source") or "billing"
+
+
+def _usage_for(mode):
+    """local 看估算行（本机日志产物），api/both 看账单行（账单优先，不重复计数）。"""
+    return "estimated" if mode == "local" else "billing"
+
+
 # --------------------------------------------------------------------------- #
 # 统计
 # --------------------------------------------------------------------------- #
@@ -396,19 +457,23 @@ def group_of(r):
 
 
 def build_sources(allrows):
-    """全部历史按来源聚合，用于看板下拉框。"""
+    """全部历史按来源聚合，用于看板下拉框。金额缺价时返回 None，不写 0。"""
     agg_src = {}
     for r in allrows:
         name = group_of(r)
         s = agg_src.setdefault(name, {"name": name, "req": 0, "tokens": 0,
-                                      "spend": 0.0, "last": 0.0})
+                                      "spend": 0.0, "known": 0, "last": 0.0,
+                                      "provider": r.get("provider") or "ustc",
+                                      "usage_source": _usage_of(r)})
         s["req"] += 1
         s["tokens"] += r["prompt"] + r["completion"]
-        s["spend"] += r["spend"]
+        if r["spend"] is not None:
+            s["spend"] += r["spend"]
+            s["known"] += 1
         s["last"] = max(s["last"], r["t0"])
     out = []
     for s in agg_src.values():
-        s["spend"] = round(s["spend"], 3)
+        s["spend"] = round(s["spend"], 3) if s.pop("known") else None
         s["last_local"] = local(s.pop("last")).strftime("%m-%d %H:%M")
         out.append(s)
     return sorted(out, key=lambda x: -x["tokens"])
@@ -431,8 +496,12 @@ def bucket_norm(v):
     return min(BUCKET_CHOICES, key=lambda x: abs(x - v))
 
 
-def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=BUCKET_DEFAULT):
-    # gap_min 保留只为兼容旧调用方；空档阈值现在固定按 GAP_CELLS 格算，与细度联动
+def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=BUCKET_DEFAULT,
+              provider=None, usage=None):
+    """usage=None/"auto" 时按当前 SOURCE 只统计一份数据：
+    local → usage_source='estimated'（本机日志 + 单价估算），api/both → 'billing'（账单真值）。
+    两份互斥，绝不求和，否则同一次调用会被算两遍。
+    gap_min 保留只为兼容旧调用方；空档阈值固定按 GAP_CELLS 格算，与细度联动。"""
     now = time.time()
     day_start = local(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     w_start = now - window_hours * 3600
@@ -444,6 +513,13 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
         )]
         allrows = [dict(r) for r in c.execute("SELECT * FROM requests ORDER BY t0")]
 
+    u = _usage_for(SOURCE) if usage in (None, "auto", "") else str(usage)
+    if u in ("estimated", "billing"):
+        allrows = [r for r in allrows if _usage_of(r) == u]
+        day_rows = [r for r in day_rows if _usage_of(r) == u]
+    if provider:
+        allrows = [r for r in allrows if (r.get("provider") or "ustc") == provider]
+        day_rows = [r for r in day_rows if (r.get("provider") or "ustc") == provider]
     sources = build_sources(allrows)
     if source:
         day_rows = [r for r in day_rows if group_of(r) == source]
@@ -455,13 +531,16 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
         comp = sum(r["completion"] for r in sel)
         dec = sum((r["t2"] - r["t1"]) for r in sel
                   if r["t1"] and r["t2"] and r["t2"] > r["t1"] and r["completion"] > 0)
+        known = [r["spend"] for r in sel if r["spend"] is not None]
         return {
             "req": len(sel),
             "prompt": sum(r["prompt"] for r in sel),
             "completion": comp,
             "total": total,
             "cached": sum(r["cached"] for r in sel),
-            "spend": sum(r["spend"] for r in sel),
+            # 没有单价的行不参与求和：全没价时返回 None（前端显示 –），绝不写 0 假装免费
+            "spend": round(sum(known), 4) if known else None,
+            "spend_cov": "%d/%d" % (len(known), len(sel)),
             "decode_s": dec,
             "tps": (comp / dec) if dec > 0 else None,
         }
@@ -595,13 +674,15 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
     for r in allrows:
         k = local(r["t0"]).date().isoformat()
         h = hist_map.setdefault(k, {"date": k, "req": 0, "prompt": 0, "completion": 0,
-                                    "spend": 0.0, "dec": 0.0, "comp": 0,
+                                    "spend": 0.0, "known": 0, "dec": 0.0, "comp": 0,
                                     "ttf": [], "cached": 0})
         h["req"] += 1
         h["prompt"] += r["prompt"]
         h["completion"] += r["completion"]
         h["cached"] += r["cached"]
-        h["spend"] += r["spend"]
+        if r["spend"] is not None:
+            h["spend"] += r["spend"]
+            h["known"] += 1
         if r["t1"] and r["t2"] and r["t2"] > r["t1"] and r["completion"] > 0:
             h["dec"] += r["t2"] - r["t1"]
             h["comp"] += r["completion"]
@@ -614,7 +695,7 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
             "date": k,
             "req": h["req"],
             "tokens": h["prompt"] + h["completion"],
-            "spend": round(h["spend"], 3),
+            "spend": round(h["spend"], 3) if h["known"] else None,
             "tps": round(h["comp"] / h["dec"], 1) if h["dec"] > 0 else None,
             "ttft_ms": round(sum(h["ttf"]) / len(h["ttf"]) * 1000) if h["ttf"] else None,
         })
@@ -622,17 +703,21 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
     all_dec = sum(h["dec"] for h in hist_map.values())
     all_comp = sum(h["comp"] for h in hist_map.values())
     all_ttf = [x for h in hist_map.values() for x in h["ttf"]]
+    _known = sum(h["known"] for h in hist_map.values())
+    _allreq = sum(h["req"] for h in hist_map.values())
     alltime = {
         "days": len(hist_map),
-        "req": sum(h["req"] for h in hist_map.values()),
+        "req": _allreq,
         "tokens": sum(h["prompt"] + h["completion"] for h in hist_map.values()),
-        "spend": round(sum(h["spend"] for h in hist_map.values()), 3),
+        "spend": round(sum(h["spend"] for h in hist_map.values()), 3) if _known else None,
+        "spend_cov": "%d/%d" % (_known, _allreq),
         "tps": round(all_comp / all_dec, 1) if all_dec > 0 else None,
         "ttft_ms": round(sum(all_ttf) / len(all_ttf) * 1000) if all_ttf else None,
     }
 
     with LOCK:
-        budgets = list(STATE["budget"] or [])
+        # local 模式没有 key/info（零密钥），额度卡整块不显示，而不是显示 0
+        budgets = list(STATE["budget"] or []) if SOURCE != "local" else []
         ki = dict(STATE["key_info"] or {})
         st = {k: STATE[k] for k in ("last_ok", "last_err", "polls", "rows")}
 
@@ -657,7 +742,7 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
             "tps": round(r["completion"] / dec, 1) if dec > 0 and r["completion"] > 0 else None,
             "ttft_ms": int((r["t1"] - r["t0"]) * 1000) if r["t1"] else None,
             "dur_s": round((r["t2"] - r["t0"]), 1) if r["t2"] else None,
-            "spend": round(r["spend"], 6),
+            "spend": None if r["spend"] is None else round(r["spend"], 6),
             "finish": r["finish"],
         })
 
@@ -665,6 +750,9 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
         "now_local": local(now).strftime("%Y-%m-%d %H:%M:%S"),
         "day_label": local(now).strftime("%Y-%m-%d"),
         "source": source,
+        "provider": provider,
+        "mode": SOURCE,
+        "usage_source": u,
         "sources": sources,
         "poll": {
             "last_ok_ago_s": int(now - st["last_ok"]) if st["last_ok"] else None,
@@ -688,6 +776,193 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=None, bucket_s=B
         "alltime": alltime,
         "recent": recent_list,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 对账：本机日志 vs 网关账单（改造自 codex-bridge/compare.py）
+# --------------------------------------------------------------------------- #
+KNOWN_GAPS = [
+    {"what": "账单比本地多约 110 条", "why": "网关把中断/失败请求也记成零 token 行",
+     "handling": "不追平，属预期"},
+    {"what": "账单多约 17 条（10-29/10-30）", "why": "DSH 尚未开始记录用量",
+     "handling": "忽略"},
+    {"what": "TTFT 本地偏高约 470ms", "why": "本地口径含 harness 装配/工具结果处理开销",
+     "handling": "不参与对账，仅标注"},
+]
+
+_RZERO = {"n": 0, "prompt": 0, "completion": 0, "spend": 0.0, "known": 0,
+          "dec": 0.0, "comp": 0, "ttf": []}
+
+
+def _rzero():
+    return dict(_RZERO, ttf=[])
+
+
+def _rpct(a, b):
+    if not b:
+        return None
+    return round((a - b) / b * 100, 2)
+
+
+def reconcile(days=30, provider=None):
+    """逐日对账：本机日志（估算口径） vs requests 里 usage_source='billing' 的账单行。
+
+    只读接口：不改库、不改数据。days 为回看天数（含今天）。
+    provider 为 None 时只对比"账单里真正出现过的 provider"（默认就是 ustc），
+    本机日志里那些没走网关的 provider（例如别人代充的账号）单独列在 unbilled，
+    否则它们会被算成"对不上"，看起来像 bug。
+    """
+    from sources.dsh_log import compute_cost, load_events, price_table, stats as _stats
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(365, days))
+    now = time.time()
+    since = now - days * 86400
+
+    events = [e for e in load_events() if (e.get("t0") or 0) >= since]
+    if provider:
+        events = [e for e in events if (e.get("provider") or "") == provider]
+    tbl = price_table()
+
+    # provider -> 日期 -> 聚合
+    loc = {}
+    for e in events:
+        pv = e.get("provider") or "unknown"
+        k = local(e["t0"]).date().isoformat()
+        x = loc.setdefault(pv, {}).setdefault(k, _rzero())
+        x["n"] += 1
+        x["prompt"] += e["uncached"] + e["cache_read"] + e["cache_write"]
+        x["completion"] += e["output"]
+        c = compute_cost(e, tbl)
+        if c is not None:
+            x["spend"] += c
+            x["known"] += 1
+        if e["t1"] and e["t2"] > e["t1"] and e["output"] > 0:
+            x["dec"] += e["t2"] - e["t1"]
+            x["comp"] += e["output"]
+        if e["t1"] and e["t1"] >= e["t0"]:
+            x["ttf"].append(e["t1"] - e["t0"])
+
+    try:
+        with db() as c:
+            bill_rows = [dict(r) for r in c.execute(
+                "SELECT * FROM requests WHERE t0 >= ? AND (usage_source = 'billing' "
+                "OR usage_source IS NULL)", (since,))]
+    except sqlite3.Error:                       # 极老的库没有 usage_source：整表当账单
+        with db() as c:
+            bill_rows = [dict(r) for r in c.execute(
+                "SELECT * FROM requests WHERE t0 >= ?", (since,))]
+    if provider:
+        bill_rows = [r for r in bill_rows if (r.get("provider") or "ustc") == provider]
+    bil, bil_prov = {}, set()
+    for r in bill_rows:
+        pv = r.get("provider") or "ustc"
+        bil_prov.add(pv)
+        k = local(r["t0"]).date().isoformat()
+        x = bil.setdefault(k, _rzero())
+        x["n"] += 1
+        x["prompt"] += r.get("prompt") or 0
+        x["completion"] += r.get("completion") or 0
+        if r.get("spend") is not None:
+            x["spend"] += r["spend"]
+            x["known"] += 1
+        if r.get("t1") and r.get("t2") and r["t2"] > r["t1"] and (r.get("completion") or 0) > 0:
+            x["dec"] += r["t2"] - r["t1"]
+            x["comp"] += r["completion"]
+        if r.get("t1") and r.get("t0") and r["t1"] >= r["t0"]:
+            x["ttf"].append(r["t1"] - r["t0"])
+
+    # 只比账单里有的 provider；账单为空（还没跑过 api 模式）时退回"全部本地 provider"
+    cmp_prov = [provider] if provider else (sorted(bil_prov) or sorted(loc))
+    cmp_prov = [p for p in cmp_prov if p in loc or p in bil_prov]
+
+    def merge(days_map, provs):
+        out = {}
+        for pv in provs:
+            for k, x in (days_map.get(pv) or {}).items():
+                y = out.setdefault(k, _rzero())
+                for f in ("n", "prompt", "completion", "spend", "known", "dec", "comp"):
+                    y[f] += x[f]
+                y["ttf"].extend(x["ttf"])
+        return out
+
+    loc_cmp = merge(loc, cmp_prov)
+    unb_days = merge({p: v for p, v in loc.items() if p not in cmp_prov}, list(loc))
+    unb = _rzero()
+    for x in unb_days.values():
+        for f in ("n", "prompt", "completion", "spend", "known", "dec", "comp"):
+            unb[f] += x[f]
+        unb["ttf"].extend(x["ttf"])
+
+    def pack(x):
+        return {
+            "req": x["n"],
+            "prompt": x["prompt"],
+            "completion": x["completion"],
+            "tokens": x["prompt"] + x["completion"],
+            "spend": round(x["spend"], 3) if x["known"] else None,
+            "tps": round(x["comp"] / x["dec"], 2) if x["dec"] > 0 else None,
+            "ttft_ms": round(sum(x["ttf"]) / len(x["ttf"]) * 1000) if x["ttf"] else None,
+        }
+
+    def pct(a, b):
+        return round((a - b) / b * 100, 2) if b else None
+
+    out = []
+    for k in sorted(set(loc_cmp) | set(bil)):
+        L = pack(loc_cmp.get(k) or _rzero())
+        B = pack(bil.get(k) or _rzero())
+        out.append({
+            "date": k, "local": L, "bill": B,
+            "diff": {
+                "req": L["req"] - B["req"],
+                "prompt_pct": pct(L["prompt"], B["prompt"]),
+                "spend_pct": pct(L["spend"] or 0, B["spend"] or 0),
+                "tps_pct": pct(L["tps"] or 0, B["tps"] or 0),
+            },
+        })
+
+    TL, TB = _rzero(), _rzero()
+    for k in set(loc_cmp) | set(bil):
+        for tgt, src_map in ((TL, loc_cmp), (TB, bil)):
+            x = src_map.get(k)
+            if not x:
+                continue
+            for f in ("n", "prompt", "completion", "spend", "known", "dec", "comp"):
+                tgt[f] += x[f]
+            tgt["ttf"].extend(x["ttf"])
+    L, B = pack(TL), pack(TB)
+    return {
+        "ok": True,
+        "days": days,
+        "provider": provider,
+        "compared_providers": cmp_prov,
+        "billing_providers": sorted(bil_prov),
+        "since_local": local(since).strftime("%Y-%m-%d %H:%M"),
+        "daily": out,
+        "total": {
+            "local": L, "bill": B,
+            "diff": {
+                "req": L["req"] - B["req"],
+                "prompt_pct": pct(L["prompt"], B["prompt"]),
+                "spend_pct": pct(L["spend"] or 0, B["spend"] or 0),
+                "tps_pct": pct(L["tps"] or 0, B["tps"] or 0),
+                "ttft_pct": pct(L["ttft_ms"] or 0, B["ttft_ms"] or 0),
+            },
+        },
+        # 本机日志里有、但网关账单里没有的 provider（没走这个网关，不该算作"对不上"）
+        "unbilled": {"providers": sorted(p for p in loc if p not in cmp_prov), **pack(unb)},
+        "notes": KNOWN_GAPS,
+        "local_stats": _stats(events, root=None),
+        "prices": price_table_path(),
+    }
+
+
+def price_table_path():
+    from sources.dsh_log import prices_path
+    return prices_path()
 
 
 # --------------------------------------------------------------------------- #
@@ -1035,15 +1310,31 @@ class Handler(BaseHTTPRequestHandler):
             STATE.setdefault("hits", collections.deque(maxlen=200)).append(
                 (time.time(), self.headers.get("User-Agent", "")[:60]))
             source = (query.get("source") or [None])[0] or None
+            provider = (query.get("provider") or [None])[0] or None
+            usage = (query.get("usage") or [None])[0] or None
             bucket_s = bucket_norm((query.get("bucket") or [BUCKET_DEFAULT])[0])
             ua = self.headers.get("User-Agent", "")
             if "Mozilla" in ua:
                 STATE["dash_seen"] = time.time()          # 有个浏览器标签开着看板
             try:
-                body = json.dumps(summarize(source=source, bucket_s=bucket_s), ensure_ascii=False)
+                body = json.dumps(summarize(source=source, bucket_s=bucket_s,
+                                            provider=provider, usage=usage),
+                                  ensure_ascii=False)
                 self._send(200, body, "application/json; charset=utf-8")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}), "application/json")
+        elif parsed.path == "/api/reconcile":
+            try:
+                days = int((query.get("days") or ["30"])[0])
+            except (TypeError, ValueError):
+                days = 30
+            provider = (query.get("provider") or [None])[0] or None
+            try:
+                body = json.dumps(reconcile(days=days, provider=provider), ensure_ascii=False)
+                self._send(200, body, "application/json; charset=utf-8")
+            except Exception as e:
+                self._send(500, json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False),
+                           "application/json; charset=utf-8")
         elif parsed.path == "/api/widget":
             self._send(200, json.dumps(widget_payload(), ensure_ascii=False),
                        "application/json; charset=utf-8")
@@ -1100,6 +1391,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="采集一轮并打印摘要")
+    ap.add_argument("--source", choices=SOURCE_CHOICES, default=None,
+                    help="数据源：local=本机 DSH 会话日志（默认，零密钥）| api=网关账单 | both")
     ap.add_argument("--backfill", action="store_true", help="回填全部历史请求")
     ap.add_argument("--since", default=DEFAULT_BACKFILL_START,
                     help=f"配合 --backfill：起始日期 YYYY-MM-DD（默认 {DEFAULT_BACKFILL_START}）")
@@ -1117,41 +1410,76 @@ def main():
             print(f"--since 需要 YYYY-MM-DD，收到 {args.since!r}", file=sys.stderr)
             return 2
 
-    if not KEY:
+    global SOURCE
+    if args.source:
+        SOURCE = args.source
+    need_api = SOURCE in ("api", "both")
+
+    init_db()                                    # 先迁移表结构，两种源都能写
+    print(f"数据源: {SOURCE}"
+          + ("（本机 DSH 会话日志，零密钥、零网络）" if SOURCE == "local"
+             else "（网关账单）" if SOURCE == "api" else "（账单优先，日志用于对账）"))
+    if SOURCE in ("local", "both"):
+        try:
+            from sources.dsh_log import stats as _dsh_stats, zstd_hint
+            _st = _dsh_stats()
+            print(f"  日志: {_st['files']} 个会话文件 · 去重后 {_st['events']} 条计费事件"
+                  f" · zstd={_st['zstd']}")
+            if _st["events"] == 0 and not _st["zstd"]:
+                print(zstd_hint(), file=sys.stderr)
+        except Exception as e:                   # 诊断失败不阻断，真问题在 poll_local 里报
+            print(f"  日志诊断失败: {e}", file=sys.stderr)
+    if need_api and not ensure_key():
         print("未找到 API Key：请设置 USTC_API_KEY 环境变量", file=sys.stderr)
         print("  PowerShell:  $env:USTC_API_KEY = 'sk-...'   （也可写进 ~/.dsh/.credentials.yaml）",
               file=sys.stderr)
-        print("  Key 在平台门户 https://llm.ustc.edu.cn/ 的「API 密钥」页创建。", file=sys.stderr)
+        print("  不想用 key：直接跑 --source local（本机日志，零密钥）。", file=sys.stderr)
         return 2
-
-    print(f"Key: {MASK(KEY)} (来源: {KEY_SRC})")
+    if need_api:
+        print(f"Key: {MASK(KEY)} (来源: {KEY_SRC})")
     print(f"DB : {DB_PATH}")
-    init_db()
     if args.backfill:
+        if not need_api:
+            print("--backfill 需要 --source api（历史账单只在网关侧）", file=sys.stderr)
+            return 2
         try:
             backfill(args.since)
         except Exception as e:
             print(f"回填失败: {_err_text(e)}", file=sys.stderr)
             return 1
         return 0
-    warm = poll_once(full=False, force_full=False)  # 先用增量把最新数据补进来看板立刻可用
+    warm = 0
+    if SOURCE in ("local", "both"):
+        warm = poll_local()
+    if SOURCE in ("api", "both"):
+        warm = poll_once(full=False, force_full=False)   # 增量补最新，看板立刻可用
 
     if args.once:
-        changed = poll_once(full=True)
+        changed = 0
+        if SOURCE in ("api", "both"):
+            changed = poll_once(full=True)
+        if SOURCE in ("local", "both"):
+            changed = poll_local()
         if warm < 0 or changed < 0:
             print(f"\n采集失败: {STATE['last_err']}", file=sys.stderr)
-            print("（Key 无效时看板仍能打开，但横幅会报 401、数据全 0）", file=sys.stderr)
             return 1
         s = summarize()
-        print(f"\n时间 {s['now_local']}")
+        money = "—" if s["day"]["spend"] is None else f"{s['day']['spend']:.4f}"
+        print(f"\n时间 {s['now_local']}   口径 {s['usage_source']}")
         print(f"1h  : {fmt_int(s['h1']['total'])} tok | 入 {fmt_int(s['h1']['prompt'])} "
               f"出 {fmt_int(s['h1']['completion'])} | {s['h1']['req']} 次 | "
               f"{s['h1']['tps'] and round(s['h1']['tps'],1)} tok/s | TTFT {s['ttft_ms']} ms")
         print(f"5m  : {fmt_int(s['m5']['total'])} tok | {s['m5']['tps'] and round(s['m5']['tps'],1)} tok/s")
-        print(f"全天: {fmt_int(s['day']['total'])} tok | {s['day']['req']} 次 | 费用 {s['day']['spend']:.4f}")
+        print(f"全天: {fmt_int(s['day']['total'])} tok | {s['day']['req']} 次 | 费用 {money}"
+              f" | 金额覆盖 {s['day'].get('spend_cov')}")
+        print(f"累计: {fmt_int(s['alltime']['tokens'])} tok | {s['alltime']['req']} 次 | "
+              f"{s['alltime']['days']} 天 | 费用 "
+              + ("—" if s['alltime']['spend'] is None else f"{s['alltime']['spend']:.2f}"))
         for b in s["budgets"]:
             print(f"限额 {b['window']:>3}: {b['used']}/{b['max']} ({b['pct']}%) "
                   f"重置 {b['reset_in_s']}s 后")
+        if s["usage_source"] == "estimated":
+            print("金额按 prices.json 单价估算，不是账单真值（≈）")
         return 0
 
     if not args.serve:
@@ -1175,12 +1503,16 @@ def main():
     def loop():
         while not stop.is_set():
             t0 = time.time()
-            poll_once()
+            if SOURCE in ("local", "both"):
+                poll_local()
+            if SOURCE in ("api", "both"):
+                poll_once()
             s = summarize()
+            spend = "—" if s['day']['spend'] is None else f"{s['day']['spend']:.3f}"
             print(f"[{local(time.time()).strftime('%H:%M:%S')}] "
                   f"req={s['h1']['req']:>2} 1h={fmt_int(s['h1']['total']):>7} "
                   f"tps={s['h1']['tps'] and round(s['h1']['tps'],1)} "
-                  f"day={fmt_int(s['day']['total']):>7} spend={s['day']['spend']:.3f}",
+                  f"day={fmt_int(s['day']['total']):>7} spend={spend}",
                   flush=True)
             stop.wait(max(1.0, POLL_SECONDS - (time.time() - t0)))
 

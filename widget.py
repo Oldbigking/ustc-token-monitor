@@ -159,9 +159,10 @@ def view(d):
     b3 = next((b for b in budgets if b.get("window") == "3h"), None)
     b12 = next((b for b in budgets if b.get("window") == "12h"), None)
     spend = day.get("spend")
+    est = d.get("usage_source") == "estimated"     # local 口径：金额是估算
     dayline = f"全天 {fmt_tok(day.get('total'))}"
-    if spend:
-        dayline += f" ¥{spend:.2f}"
+    if spend is not None:
+        dayline += f" {'≈' if est else ''}¥{spend:.2f}"
     return {
         "tps": m5a.get("tps"),
         "idle": fmt_idle(m5a.get("idle_s")),
@@ -578,6 +579,18 @@ class Widget:
             self.cv.itemconfigure(it, text=txt, font=font, fill=fill, anchor=anchor)
         return it
 
+    def _drop(self, *names):
+        """删掉某个元素（连同 _bar/_pill 派生出来的格子）——用于"这次不该有它"。
+        光不画是不够的：上一帧画过的元素会留在画布上。"""
+        for n in names:
+            for key in (n, n + "t", n + "f", n + "bg"):
+                it = self._items.pop(key, None)
+                if it is not None:
+                    try:
+                        self.cv.delete(it)
+                    except Exception:
+                        pass
+
     def _rect(self, name, x1, y1, x2, y2, fill, **kw):
         it = self._items.get(name)
         if it is None:
@@ -675,16 +688,21 @@ class Widget:
                    f_lbl, C["dim"])
         self._text("ttft", W - pad, S(74), v.get("ttft", "首包 —"), f_lbl, C["dim"], anchor="e")
 
-        # ---- 限额两条 ----
+        # ---- 限额两条（没有额度数据时整行不画，别显示 0） ----
         barw = W - pad - S(26) - S(58)
-        for idx, key in ((0, "b3"), (1, "b12")):
-            b = v.get(key)
-            txt, pct = budget_text(b)
-            y = S(96) + idx * S(23)
-            self._text(key + "l", pad, y + S(3), "3h" if idx == 0 else "12h", f_btn, C["faint"])
-            color = C["red"] if pct > 85 else C["amber"] if pct > 60 else C["blue"]
-            self._bar(key, pad + S(26), y, barw, pct, color)
-            self._text(key + "v", W - pad, y + S(3), txt, f_btn, C["dim"], anchor="e")
+        if v.get("b3") or v.get("b12"):
+            self._drop("nolimit")
+            for idx, key in ((0, "b3"), (1, "b12")):
+                b = v.get(key)
+                txt, pct = budget_text(b)
+                y = S(96) + idx * S(23)
+                self._text(key + "l", pad, y + S(3), "3h" if idx == 0 else "12h", f_btn, C["faint"])
+                color = C["red"] if pct > 85 else C["amber"] if pct > 60 else C["blue"]
+                self._bar(key, pad + S(26), y, barw, pct, color)
+                self._text(key + "v", W - pad, y + S(3), txt, f_btn, C["dim"], anchor="e")
+        else:
+            self._drop("b3l", "b3v", "b3", "b12l", "b12v", "b12")
+            self._text("nolimit", pad, S(99), "本机日志模式 · 无额度信息", f_btn, C["faint"])
 
         # ---- 底线：时间 / 全天 ----
         if err:
@@ -772,7 +790,10 @@ def selftest():
     # 空数据 / 缺字段
     wdg.render(view({}))
     t = texts()
-    ok.append(("空数据不崩", t.get("tps") == "—" and t.get("b3v") == "—", t.get("tps")))
+    # 没有额度数据时不再画 0，而是给一行说明（local 模式）
+    ok.append(("空数据不崩", t.get("tps") == "—" and t.get("b3v") is None
+               and "本机日志模式" in (t.get("nolimit") or ""),
+               f"{t.get('tps')} / {t.get('nolimit')}"))
     ok.append(("空数据不出界", not inside(), ";".join(inside())))
 
     # 采集异常

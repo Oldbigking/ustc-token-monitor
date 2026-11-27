@@ -197,7 +197,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
       <div class="big"><span id="atTtft">–</span></div>
       <div class="meta" id="atTtftMeta">–</div>
     </div>
-    <div class="card">
+    <div class="card" id="budgetCard">
       <div class="lbl">限额</div>
       <div class="budget">
         <div class="row"><span class="k">3h</span><b id="b3used">–</b><span class="k">/ <span id="b3max">–</span></span><span class="pct" id="b3pct"></span></div>
@@ -241,8 +241,7 @@ footer{margin-top:20px;color:var(--dim);font-size:11.5px;line-height:1.7}
   </section>
 
   <footer id="footer">
-    数据源：平台账单接口 <code>/spend/logs/v2</code> · 每 10s 采集 · 仅统计已完成请求 ·
-    速度 = 输出 token ÷ (结束时间 − 首 token 时间)
+    <span id="footerSrc">数据源：本机 DSH 会话日志 · 每 10s 扫描 · 零密钥 · 速度 = 输出 token ÷ (首个 chunk → 落盘)</span>
   </footer>
 </div>
 
@@ -812,25 +811,43 @@ async function tick() {
     + ` · 缓存 ${d.h1.prompt ? Math.round(d.h1.cached / d.h1.prompt * 100) : 0}%`;
   $('daytotal').textContent = fmt(d.day.total);
   $('daymeta').textContent = `${d.day.req} 次 · 入 ${fmt(d.day.prompt)} / 出 ${fmt(d.day.completion)}`;
-  $('dayspend').textContent = d.day.spend.toFixed(3);
-  $('spendmeta').textContent = `${d.day_label} · ${d.day.req} 次请求`;
+  const est = (d.usage_source === 'estimated');          /* 金额是单价估算，不是账单真值 */
+  const EQ = est ? '≈' : '';
+  const money = (v, digits) => (v === null || v === undefined) ? '–'
+    : EQ + Number(v).toFixed(digits);
+  $('dayspend').textContent = money(d.day.spend, 3);
+  $('spendmeta').textContent = `${d.day_label} · ${d.day.req} 次请求`
+    + (est ? ` · 按单价估算（覆盖 ${d.day.spend_cov || '—'}）` : '');
 
   /* 历史 */
   const at = d.alltime || {};
   $('atTotal').textContent = fmt(at.tokens);
-  $('atTotalMeta').textContent = `${at.days || 0} 天 · ${at.req || 0} 次 · 费用 ${(at.spend || 0).toFixed(2)}`;
+  $('atTotalMeta').textContent = `${at.days || 0} 天 · ${at.req || 0} 次 · 费用 ${money(at.spend, 2)}`;
   $('atTps').textContent = at.tps !== null && at.tps !== undefined ? at.tps.toFixed(1) : '–';
   $('atMeta').textContent = `今日 ${d.day.tps ? d.day.tps.toFixed(1) : '–'} tok/s · 近 1h ${d.h1.tps ? d.h1.tps.toFixed(1) : '–'}`;
   $('atTtft').textContent = ms(at.ttft_ms);
   $('atTtftMeta').textContent = `今日平均 ${ms(d.ttft_ms)}`;
 
-  /* 限额（key 级，不受来源筛选影响） */
-  const b3 = (d.budgets || []).find(b => b.window === '3h') || d.budgets[0];
+  /* 限额（key 级，不受来源筛选影响）；local 模式没有额度数据，整块不画 */
+  const hasBudget = (d.budgets || []).length > 0 && (d.budgets || []).some(b => b && b.max);
+  $('budgetCard').style.display = hasBudget ? '' : 'none';
+  const b3 = (d.budgets || []).find(b => b.window === '3h') || (d.budgets || [])[0];
   const b12 = (d.budgets || []).find(b => b.window === '12h') || d.budgets[1];
   renderBudget(b3, { used: 'b3used', max: 'b3max', pct: 'b3pct', bar: 'b3bar' });
   renderBudget(b12, { used: 'b12used', max: 'b12max', pct: 'b12pct', bar: 'b12bar' });
   const resetIn = b3 && b3.reset_in_s !== null && b3.reset_in_s !== undefined ? '3h 窗口 ' + dur(b3.reset_in_s) + ' 后重置' : '';
   $('bmeta').textContent = resetIn || '限额按 API Key 计，不随来源筛选变化';
+
+  /* 页脚：说清当前口径 */
+  const fs = $('footerSrc');
+  if (fs) {
+    fs.innerHTML = d.mode === 'api'
+      ? '数据源：平台账单接口 <code>/spend/logs/v2</code> · 每 10s 拉取 · 金额为账单真值'
+      : d.mode === 'both'
+        ? '数据源：平台账单（展示）+ 本机日志（对账）· 每 10s 拉取 · 金额为账单真值'
+        : '数据源：本机 DSH 会话日志（零密钥、零网络）· 每 10s 扫描 · 金额按 prices.json 单价估算（≈）'
+          + ' · 首 token 含本地 harness 开销';
+  }
 
   /* 图表 */
   /* 折轴时间线：超过阈值的空档被压成一个断点格子 */
@@ -862,13 +879,15 @@ async function tick() {
       '<div><b>' + fx.tokY(h.tokens) + '</b> <span class="k">token</span></div>' +
       '<div><b>' + tps + '</b> <span class="k">tok/s</span></div>' +
       '<div><b>' + ttft + '</b> <span class="k">首 token</span></div>' +
-      '<div class="k">费用 ' + Number(h.spend || 0).toFixed(2) + '</div>';
+      '<div class="k">费用 ' + (h.spend === null || h.spend === undefined ? '–'
+        : EQ + Number(h.spend).toFixed(2)) + (est ? '（估算）' : '') + '</div>';
   };
   chart('chartDayTok', {
     kind: 'bar', color: '--blue', fmtV: fx.tokY, unit: 'token', ref: null,
     pad: DAY_PAD, sync: 'daily', tip: dayTip,
     data: hist.map(h => ({ t: h.date.slice(5), v: h.tokens,
-      extra: h.req + ' 次 · 费用 ' + Number(h.spend || 0).toFixed(2) })),
+      extra: h.req + ' 次 · 费用 ' + (h.spend === null || h.spend === undefined ? '–'
+        : EQ + Number(h.spend).toFixed(2)) })),
   });
   chart('chartDayPerf', {
     kind: 'line', color: '--green', fmtV: fx.tpsY, unit: 'tok/s',
@@ -892,7 +911,7 @@ async function tick() {
     <td>${x.tps !== null && x.tps !== undefined ? x.tps.toFixed(1) : '–'}</td>
     <td>${ms(x.ttft_ms)}</td>
     <td>${x.dur_s !== null && x.dur_s !== undefined ? x.dur_s.toFixed(1) + 's' : '–'}</td>
-    <td>${(x.spend || 0).toFixed(4)}</td>
+    <td>${x.spend === null || x.spend === undefined ? '–' : EQ + Number(x.spend).toFixed(4)}</td>
   </tr>`).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--dim);padding:18px">暂无请求</td></tr>';
 }
 

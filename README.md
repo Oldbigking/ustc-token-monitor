@@ -1,9 +1,11 @@
 # USTC Token 监测器
 
-监测 `https://api.llm.ustc.edu.cn`（大模型公共服务平台的 LiteLLM 网关）上的
-**平均生成速度（tok/s）**、**首 token 延迟**、**1 小时用量**、**3h / 12h 限额**、
-**全天用量与费用**、**历史每日速度/延迟**。
-数据全部来自平台自己的账单接口，**不消耗任何 token**。
+监测你在 **DSH 里真实的模型调用**：**平均生成速度（tok/s）**、**首 token 延迟**、
+**1 小时 / 全天用量与费用**、**历史每日速度/延迟**、**3h / 12h 限额**（API 模式）。
+
+默认数据源是**本机 DSH 会话日志**（`~/.dsh/sessions/**/session.v4.jsonl.zstd`）：
+**零 API key、零网络请求、不产生任何计费**——装好就能用。
+要跟网关账单对账时再加 `--source api`（读平台 `/spend/logs/v2`）或用 `--source both`。
 
 两种用法：
 
@@ -12,9 +14,21 @@
 
 ---
 
-## 0. 前置条件：一个 USTC 平台的 API Key
+## 0. 前置条件
 
-监测器读的是你自己的账单，**没有 Key 什么都跑不起来**（会直接退出，退出码 2）。
+**默认的 `--source local` 只要 Python 3.9+ 和一个 DSH 会话目录**，不需要 Key，
+也不用手工装依赖（Python < 3.14 读 `.jsonl.zstd` 需要一个解压库，见下）。
+
+```powershell
+pip install zstandard        # 只在 Python 3.9–3.13 需要；3.14+ 已内置 compression.zstd
+```
+
+装不上也不影响启动：`--source api` 走网关账单，完全不碰 zstd；
+`python monitor.py --once` 会在 stderr 打出可操作的提示而不是 traceback。
+
+### 只有 `--source api` 才需要 Key
+
+`api` / `both` 模式读的是你在 USTC 平台上的账单，**没有 Key 会直接退出（码 2）**。
 
 1. 打开平台门户 <https://llm.ustc.edu.cn/>，登录 → 「API 密钥」→ 创建 → 复制 `sk-...`
 2. 三选一配置（优先级从上到下）：
@@ -30,13 +44,15 @@
    USTC_API_KEY: sk-...
    ```
 
-3. 依赖：**Python 3.9+，仅标准库**，不需要 `pip install`。
+3. 依赖：Python 3.9+；`api` 模式仅标准库，`local` 模式另需 `zstandard`（3.14+ 免装）。
 
 配错时的确切行为（照此判断，不用猜）：
 
 | 情况 | 现象 | 退出码 |
 |---|---|---|
-| 完全没配 Key | stderr 打出提示，不建库、不起服务 | `2` |
+| `local` 模式找不到会话日志 | 提示 0 个文件，看板照常打开但全 0 | `--once` 退出 `0` |
+| `local` 模式缺 zstandard | stderr 给出 `pip install zstandard` 提示，不动库 | `--once` 退出 `1` |
+| `api` 模式完全没配 Key | stderr 打出提示，不建库、不起服务 | `2` |
 | Key 无效（401） | 服务照常起来，看板顶部横幅 `采集异常：平台返回 401（密钥无效）`，数字全 0 | `--once` 退出 `1`；`--serve` 保持运行等修好 |
 | 端口被占用 | 提示换个端口后退出 | `2` |
 | 平台不可达 / 5xx 重试耗尽 | 看板横幅标红，人话错误 | `--once` 退出 `1` |
@@ -55,8 +71,10 @@ cd ustc-token-monitor
 ```bat
 start.bat                        :: 启动看板（Ctrl+C 停止；参数会透传给 monitor.py）
 start.bat --port 9000            :: 换个端口
-python monitor.py --once         :: 采集一轮并打印摘要（失败退出码 1）
-python monitor.py --backfill     :: 回填历史（默认从平台开通日 2026-10-29 起）
+python monitor.py --once         :: 采集一轮并打印摘要（默认读本机日志，零密钥）
+python monitor.py --source api --once     :: 换成读网关账单
+python monitor.py --source both           :: 两个都采：账单用于展示，日志用于对账
+python monitor.py --backfill     :: 回填历史账单（只有 api 模式有这概念）
 python monitor.py --backfill --since 2026-11-01
 ```
 
@@ -95,12 +113,63 @@ curl.exe -s http://127.0.0.1:8790/api/summary | ConvertFrom-Json | Select last_e
 | 全天用量 / 费用 | 北京时间 00:00 起至现在 |
 | 历史总用量 | 全部已入库请求的 token 合计（含费用、天数、次数），按当前来源筛选后计算 |
 | 历史 | 按本地日聚合全部已入库请求，给出每日平均 tok/s 与平均 TTFT |
-| 来源 | 平台账单的 `model_group`（老数据没有该字段时退回 `model`） |
+| 来源 | `<provider>/<model>`（local 从日志的 `message.source` 取，api 从账单 `model_group` 取） |
+| 费用（local） | `未缓存 × 单价 + (缓存读 + 缓存写) × 缓存单价 + 输出 × 输出单价`，单价见 `prices.json`；**是估算，不是账单真值**，看板上带 `≈` 前缀 |
 
 `completion_tokens` 包含推理 token；输入里很大比例命中缓存（通常 95%+），
 卡片刻意把缓存命中率单独展示。
 
+**local 口径的两个已知差异**（不是 bug，别去"修"）：
+
+1. **首 token 延迟比账单口径高约 470ms**（实测 1,149ms vs 680ms）：本地只有
+   `step/start` 到首个 stream chunk 的时间戳，中间含 harness 装配、工具结果处理等
+   开销；**tok/s 不受影响**（52.47 vs 52.70），因为它是"首个 chunk → 落盘"的纯生成区间。
+2. **请求数与账单不完全相等**：账单里有约 110 条零 token 行（中断/失败请求），
+   还有 17 条 11-03 之前的历史（那时 DSH 还没开始记录用量）。合计 token 偏差
+   **0.3%** 以内、金额偏差 **1%** 以内，逐日偏差见 `/api/reconcile`。
+
 ## 数据来源
+
+`--source` 三档，默认 `local`：
+
+| 模式 | 读什么 | 需要 Key | 金额 |
+|---|---|---|---|
+| `local`（默认） | 本机 DSH 会话日志 | 否 | 按 `prices.json` 单价估算（`≈`） |
+| `api` | 平台账单接口 `/spend/logs/v2` | 是 | 账单真值 |
+| `both` | 两个都采 | 是 | 展示用账单，日志用于对账 |
+
+### local：本机 DSH 会话日志（默认，零密钥）
+
+`~/.dsh/sessions/<工作区>/session-<uuid>/session.v4.jsonl.zstd`，一行一个 JSON 事件。
+**只有两种事件带用量**：`assistant/message` 与 `compaction/summary`，都在 `data.usage` 里：
+
+```json
+{"inputTokens": 1100, "outputTokens": 1466, "totalTokens": 11334,
+ "cacheReadTokens": 8768, "cacheWriteTokens": 0}
+```
+
+口径与几个坑（改 `sources/dsh_log.py` 前先看这里）：
+
+- **`prompt = inputTokens + cacheReadTokens + cacheWriteTokens`**（`totalTokens` 是这四项之和，
+  直接拿它当 prompt 会把输出算两遍）。
+- **`assistant/attempt` 一律不用**：那是重试事件，`usage` 恒为 0，混进来会拉低均值。
+- **fork / 续接会话会复制父会话的事件**，必须按 `(类型, time_ms, turn, step)` 去重，
+  且先按会话 `createdAt` 升序处理（父先占位）。不去重会虚高 1.5 倍以上。
+- `t0` 取 `step/start` 的时间（按 `(turn, step)` 配对），`t1` 取首个 stream chunk，
+  `t2` 取事件时间；三者错位会让 TTFT / tok/s 变成负数或无穷大。
+- 增量缓存按 `(size, mtime_ns)` 判定，落在 `%LOCALAPPDATA%\ustc-token-monitor\dsh-usage-cache.json`
+  （可用 `USTC_TOKEN_CACHE` 覆盖）；**不要用字节偏移当游标**——zstd 是多帧追加流。
+
+可覆盖的环境变量（换机器 / 非标准目录时用，不必改代码）：
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `USTC_TOKEN_DSH_ROOT` | 会话日志根目录 | `~/.dsh/sessions` |
+| `USTC_TOKEN_CACHE` | 增量缓存文件 | `%LOCALAPPDATA%\ustc-token-monitor\dsh-usage-cache.json` |
+| `USTC_TOKEN_PRICES` | 价目表 | 仓库根的 `prices.json` |
+| `USTC_TOKEN_SOURCE` | 数据源 | `local` |
+
+### api：平台账单（需要 Key）
 
 - `GET /spend/logs/v2?start_date=&end_date=&page=&page_size=` — 逐请求账单
   （`startTime / completionStartTime / endTime / prompt_tokens / completion_tokens / cached_tokens / spend / model`）
@@ -108,6 +177,26 @@ curl.exe -s http://127.0.0.1:8790/api/summary | ConvertFrom-Json | Select last_e
 
 采集策略：启动时增量拉第 1 页（遇到已知 `request_id` 即停），每 10s 一轮，
 每 30 分钟全量对齐一次；看板与客户端状态条每 5s 刷新一次；只读、单连接、失败退避。
+**`local` 模式完全不走这段代码，也不读 `~/.dsh/.credentials.yaml`。**
+
+### 两种源怎么共存（不重复计数）
+
+`requests` 表加了两列：`provider`（`ustc` 等）和 `usage_source`（`billing` / `estimated`）。
+local 写入的行是 `estimated`，api 写入的是 `billing`，`request_id` 前缀也不同
+（`dsh:call|...` vs 网关的 uuid），所以两批数据可以同时留在库里互不覆盖。
+`/api/summary` 默认**只取一份**（`local` → `estimated`，`api`/`both` → `billing`），
+不会把同一次调用算两遍。
+
+### 对账接口
+
+```powershell
+curl.exe -s "http://127.0.0.1:8790/api/reconcile?days=30"     # 逐日 + 合计的偏差
+python tools\compare.py --days 30                            # 同一套逻辑的命令行版
+```
+
+返回每天的 `local`（日志估算）/ `bill`（账单）与偏差，外加 `total`、`notes`（已知对不上的项）、
+`unbilled`（日志里有、但没走这个网关的 provider）。验收阈值：合计 token ≤1%、
+金额 ≤2%、tok/s ≤2%。
 
 账单拉取遇到平台偶发 5xx / 429 / 网络抖动时，**同一轮内最多重试 3 次**
 （间隔 0 / 1.5s / 4s），三次都失败才在看板标红，并把错误翻成人话
