@@ -525,13 +525,14 @@ def summarize(window_hours=1.0, recent=12, source=None, gap_min=30, bucket_s=BUC
         raw = bucket([r for r in allrows if r["t0"] >= a0], bucket_s, a0, cnt)
 
         # 时间标签：30s 带秒、跨天窗口带日期，其余只到分
-        span_s = cnt * bucket_s
+        # 可见窗口 = 60 格 × 细度；跨天时只在 00:00 那格写日期，其余写时分（标签短才排得开）
+        visible_s = min(cnt, 60) * bucket_s
         for b in raw:
             d = local(b["t"])
             if bucket_s < 60:
                 b["t_local"] = d.strftime("%H:%M:%S")
-            elif span_s > 30 * 3600:
-                b["t_local"] = d.strftime("%m-%d %H:%M")
+            elif visible_s > 24 * 3600 and d.hour == 0 and d.minute == 0:
+                b["t_local"] = d.strftime("%m-%d")
             else:
                 b["t_local"] = d.strftime("%H:%M")
 

@@ -563,16 +563,23 @@ function draw(id) {
     putLabel(L2, true);
     taken.push({ x: L2.x0, y: B + 4, w: L2.lw, h: 14 });
   });
-  const lstep = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(pw / 64))));
-  let lastRightX = -1e9;
-  data.forEach((d, i) => {
-    if (d.brk || i % lstep) return;
+  /* x 轴标签：先放跨天日期（11-26 这种，保证日期一定出现），再按"放得下就放"填空隙。
+     固定步长抽稀在格子多、标签宽时容易只剩一两个标签，所以改成逐格尝试 + 碰撞检测。 */
+  const xFree = (box) => !taken.some(b =>
+    b.y < B + 18 && B + 4 < b.y + b.h &&
+    box.x - 4 < b.x + b.w && b.x < box.x + box.w + 4);
+  const isDay = d => !d.brk && /^\d{2}-\d{2}$/.test(String(d.t));
+  const putX = (i) => {
+    const d = data[i];
+    if (!d || d.brk) return;
     const L2 = labelAt(String(d.t), 10.5, cxOf(i));
-    if (L2.x0 < lastRightX + 6) return;
-    if (taken.some(b => L2.x0 < b.x + b.w && b.x < L2.x0 + L2.lw && B + 4 < b.y + b.h && b.y < B + 18)) return;
+    const box = { x: L2.x0, y: B + 4, w: L2.lw, h: 14 };
+    if (!xFree(box)) return;
     putLabel(L2, false);
-    lastRightX = L2.x0 + L2.lw;
-  });
+    taken.push(box);
+  };
+  data.forEach((d, i) => { if (isDay(d)) putX(i); });
+  data.forEach((d, i) => { if (!isDay(d)) putX(i); });
 
   s += '<g class="hov" style="display:none">' +
        '<rect class="hvbar" x="0" y="' + T + '" width="0" height="' + ph + '" fill="' + P.txt + '" opacity="0.06"/>' +
