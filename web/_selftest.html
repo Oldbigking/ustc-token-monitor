@@ -264,7 +264,7 @@ function run() {
   if (!okAlign) fails.push('横轴对齐');
 
   /* 折线连续性：同一段内的空值只是缺采样（connect），断点格子才是真断开 */
-  const lineCount = (connect, extra) => {
+  const lineCount = (connect, extra, emptyAt) => {
     const id = 'tsConn' + (++seq);
     const el = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
     el.setAttribute('id', id);
@@ -272,9 +272,11 @@ function run() {
     el.style.cssText = 'display:block;width:600px;height:190px';
     doc.body.appendChild(el);
     w.applyTheme('light', false);
-    const src2 = extra
-      ? [{ t: '1', v: 10 }, { t: '2', v: 20 }, { t: '3', brk: true, gap_label: '2h' }, { t: '4', v: 40 }, { t: '5', v: 50 }]
-      : [{ t: '1', v: 10 }, { t: '2', v: 20 }, { t: '3', v: null }, { t: '4', v: 40 }, { t: '5', v: 50 }];
+    const src2 = emptyAt
+      ? [{ t: '1', v: 10 }, { t: '2', v: 20 }, { t: '3', v: null, empty: true }, { t: '4', v: 40 }, { t: '5', v: 50 }]
+      : extra
+        ? [{ t: '1', v: 10 }, { t: '2', v: 20 }, { t: '3', brk: true, gap_label: '2h' }, { t: '4', v: 40 }, { t: '5', v: 50 }]
+        : [{ t: '1', v: 10 }, { t: '2', v: 20 }, { t: '3', v: null }, { t: '4', v: 40 }, { t: '5', v: 50 }];
     w.chart(id, {
       kind: 'bar', color: '--green', fmtV: v => String(Math.round(v)),
       data: [{ t: '1', v: 5 }, { t: '2', v: 6 }, { t: '3', v: 7 }, { t: '4', v: 8 }, { t: '5', v: 9 }],
@@ -286,16 +288,19 @@ function run() {
   const connOn = lineCount(true, false);
   const connOff = lineCount(false, false);
   const connBrk = lineCount(true, true);
+  const connEmpty = lineCount(true, false, true);
   const connOk = connOn.length === 1 && connOn[0] === 4
     && connOff.length === 2
-    && connBrk.length === 2;
+    && connBrk.length === 2
+    && connEmpty.length === 2;
   checked++;
   if (!connOk) {
     fails.push('折线连续');
-    log.push('FAIL 折线连续 connect=' + JSON.stringify(connOn) +
-      ' plain=' + JSON.stringify(connOff) + ' 断点=' + JSON.stringify(connBrk));
+    log.push('FAIL 折线连续 有采样空值=' + JSON.stringify(connOn) +
+      ' 默认=' + JSON.stringify(connOff) + ' 断点=' + JSON.stringify(connBrk) +
+      ' 空档格=' + JSON.stringify(connEmpty));
   } else {
-    log.push('ok   折线连续（段内 1 条 4 点 / 不连 2 条 / 断点 2 条）');
+    log.push('ok   折线连续（有采样空值 1 条 / 默认 2 条 / 断点 2 条 / 空档格 2 条）');
   }
 
   /* 纵轴贴合度：数据最大值 / 轴上限 应 >= 0.78（旧算法 118 → 200 只有 0.59） */
